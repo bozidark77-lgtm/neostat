@@ -5,20 +5,20 @@ Desktop tool (Neostat™) that reconciles a **supplier work-hours report**
 (`AMS Team … BREZA`, `.xlsx`) and writes a styled, multi-sheet Excel report
 (`Nalaz.xlsx`).
 
-It pairs BREZA `ULAZ`/`IZLAZ` (in/out) events into work intervals, matches each
-supplier row to the best BREZA interval within a time tolerance, and flags
-irregularities.
+It pairs BREZA `ULAZ`/`IZLAZ` (in/out) events into work intervals, compares each
+supplier row's claimed hours to the worker's actual BREZA presence that day, and
+flags irregularities — **each labelled with the plant (pogon)**.
 
-| Code                       | Meaning                                            |
-|----------------------------|----------------------------------------------------|
-| `LATE_IN`                  | Supplier entry later than BREZA beyond tolerance   |
-| `EARLY_OUT`                | Supplier exit earlier than BREZA beyond tolerance  |
-| `MISSING_ON_BREZA`         | No BREZA event for that card + date                |
-| `WRONG_CARD_ID`            | Same worker/date in BREZA under a different card   |
-| `OVERLAP_DIFFERENT_PLANTS` | Overlapping work logged at different plants        |
+| Code                       | Meaning                                                                     |
+|----------------------------|-----------------------------------------------------------------------------|
+| `DUPLIRANI_SATI`           | Same worker billed for overlapping hours the same day at the same plant (e.g. 2×8h) |
+| `MANJAK_SATI`              | Claimed hours (`Sati rada`) exceed actual BREZA presence — late in, early out, or a mid-shift exit |
+| `OVERLAP_DIFFERENT_PLANTS` | Same worker logged at two different plants with overlapping hours           |
+| `MISSING_ON_BREZA`         | No BREZA event for that card + date                                         |
+| `WRONG_CARD_ID`            | Same worker/date in BREZA under a different card                            |
 
 The report (`Nalaz.xlsx`) has seven sheets: `REZIME`, `NEPRAVILNOSTI`,
-`UPARENO`, `KASNJENJE_ULAZI`, `RANIJI_IZLAZI`, `DOBAVLJAC_NORMALIZOVANO`,
+`DUPLIRANI_SATI`, `MANJAK_SATI`, `UPARENO`, `DOBAVLJAC_NORMALIZOVANO`,
 `BREZA_INTERVALI`.
 
 ## Run from source (any OS)
@@ -76,7 +76,9 @@ produce a valid report end-to-end.
 ## Provenance
 
 The `src/` modules were reconstructed from the original `Neostat_Analiza.exe`
-(a PyInstaller bundle). Signatures, column aliases, issue codes, Serbian labels
-and sheet names are exact; intra-function control flow is reconstructed. See
-**`SUMMARY.md`** for the full recovery story and how to obtain a byte-exact
-decompile if you need one.
+(a PyInstaller bundle); the parsing, column aliases, Serbian labels and styling
+are kept verbatim. The **detection logic was then reworked** to fix the errors
+HBIS reported for May 2026 (duplicated hours, mid-shift short hours, and showing
+the plant) and to cut the false-positive noise — so the engine no longer matches
+the original binary by design. See **`BUILD_SPEC.md` → "Analysis changes"** for
+what changed and why, and **`SUMMARY.md`** for the recovery story.

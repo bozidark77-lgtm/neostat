@@ -36,17 +36,17 @@ SUPPLIER_XLSX = FIX / "IZVESTAJ DOBAVLJACA TEST.xlsx"
 BREZA_XLSX = FIX / "AMS Team TEST - BREZA.xlsx"
 
 EXPECTED_SHEETS = [
-    "REZIME", "NEPRAVILNOSTI", "UPARENO", "KASNJENJE_ULAZI",
-    "RANIJI_IZLAZI", "DOBAVLJAC_NORMALIZOVANO", "BREZA_INTERVALI",
+    "REZIME", "NEPRAVILNOSTI", "DUPLIRANI_SATI", "MANJAK_SATI",
+    "UPARENO", "DOBAVLJAC_NORMALIZOVANO", "BREZA_INTERVALI",
 ]
 
 # The fixtures are built to trigger exactly one of each irregularity type.
 EXPECTED_ISSUE_COUNTS = {
-    "Kašnjenje ulaza": 1,
-    "Raniji izlaz": 1,
+    "Duplirani sati (isti pogon)": 1,
+    "Manjak sati (prijavljeno > BREZA)": 1,
+    "Preklapanje na različitim pogonima": 1,
     "Nema u BREZA evidenciji": 1,
     "Pogrešan ID kartice": 1,
-    "Preklapanje na različitim pogonima": 1,
 }
 
 
@@ -72,7 +72,7 @@ def main() -> None:
             if not p.exists() or p.stat().st_size == 0:
                 fail("conversion produced an empty CSV: " + p.name)
 
-        # 2) CSV -> styled 7-sheet report
+        # 2) CSV -> styled 7-sheet report (15-min hours tolerance)
         generate_report(str(sup_csv), str(brz_csv), str(out_xlsx))
         if not out_xlsx.exists():
             fail("generate_report did not write " + out_xlsx.name)
@@ -93,7 +93,15 @@ def main() -> None:
             if got != want:
                 fail("REZIME['" + metric + "'] = " + str(got) + ", expected " + str(want))
 
-        print("SMOKE TEST OK — 7 sheets, all five irregularity types detected.")
+        # 5) every irregularity must name the plant (HBIS issue C)
+        nepr = pd.read_excel(out_xlsx, sheet_name="NEPRAVILNOSTI", engine="openpyxl")
+        if "pogon" not in nepr.columns:
+            fail("NEPRAVILNOSTI is missing the 'pogon' (plant) column.")
+        blank = nepr["pogon"].isna() | (nepr["pogon"].astype(str).str.strip() == "")
+        if blank.any():
+            fail(str(int(blank.sum())) + " irregularity row(s) have no plant.")
+
+        print("SMOKE TEST OK — 7 sheets, all five irregularity types detected, plant on every finding.")
         print("  sheets: " + ", ".join(sheets))
         for metric in EXPECTED_ISSUE_COUNTS:
             print("  " + metric + ": " + str(int(metrics[metric])))

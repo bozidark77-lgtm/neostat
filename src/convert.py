@@ -85,8 +85,27 @@ _SUPPLIER_ALIASES = {
 }
 
 
+def _plant_from_sheet(sheet_name) -> str:
+    """Derive the plant (pogon) from a supplier sheet name.
+
+    The supplier workbook keeps one sheet per plant, e.g. 'Izvestaj Aglomeracija',
+    'Izvestaj VP REMONT(2)'. Strip the leading 'Izvestaj' and any trailing '(2)'
+    copy-marker so we get 'Aglomeracija' / 'VP REMONT'. This is the only place the
+    plant is recorded, so it must be preserved into the CSV for analyze.py.
+    """
+    s = str(sheet_name).strip()
+    s = re.sub(r"^izve[sš]taj\s*", "", s, flags=re.IGNORECASE)  # drop 'Izvestaj' prefix
+    s = re.sub(r"\s*\(\d+\)\s*$", "", s)                        # drop trailing '(2)'
+    return s.strip()
+
+
 def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
-    """Read every sheet of the supplier workbook and concatenate non-empty rows."""
+    """Read every sheet of the supplier workbook and concatenate non-empty rows.
+
+    Each row is tagged with its plant (from the sheet name) in a 'Pogon' column,
+    because the report is organised one plant per sheet and that is the only place
+    the plant of work is recorded.
+    """
     sheets = pd.read_excel(input_path, sheet_name=None, engine="openpyxl")
     frames = []
     for _name, sdf in sheets.items():
@@ -94,6 +113,7 @@ def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
             continue
         sdf = sdf.dropna(how="all").copy()
         if not sdf.empty:
+            sdf["Pogon"] = _plant_from_sheet(_name)
             frames.append(sdf)
     if not frames:
         return pd.DataFrame()

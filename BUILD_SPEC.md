@@ -155,12 +155,41 @@ python app.py
   `try/except`, and the spec only bundles files that exist — so the build is
   green even with an empty `assets/`.
 
+## Analysis changes (May 2026 HBIS fixes)
+
+The original engine missed the errors HBIS flagged for May 2026 and buried them
+under false positives (≈1,280 of 1,316 findings were `LATE_IN`/`EARLY_OUT` from
+comparing rounded supplier times to exact gate times). The detection logic in
+`analyze.py` was reworked accordingly — it **no longer matches the original
+binary**, by design:
+
+| Finding (label)               | What it catches                                                        |
+|-------------------------------|------------------------------------------------------------------------|
+| `DUPLIRANI_SATI`              | A worker's same-day rows whose hours overlap on the **same plant** (e.g. duplicated 2×8h). The original only checked BREZA and skipped same-plant overlaps. |
+| `MANJAK_SATI`                 | Claimed `Sati rada` exceeds the worker's **actual BREZA presence** for the day (sum of intervals, so a mid-shift exit reduces it). Replaces the noisy per-timestamp late/early checks. |
+| `OVERLAP_DIFFERENT_PLANTS`    | Same worker logged at two different plants with overlapping hours (now from the supplier report, not gate-code prefixes). |
+| `MISSING_ON_BREZA` / `WRONG_CARD_ID` | Unchanged in meaning; now carry the plant.                     |
+
+Supporting changes:
+
+- **Plant (pogon) on every finding.** The supplier report is one sheet per plant;
+  `convert.py` now writes a `Pogon` column from the sheet name (stripping the
+  `Izvestaj` prefix and `(2)` copy-marker), and `analyze.py` threads it through.
+- **Claimed hours.** `analyze.py` reads `Sati rada` (falling back to out−in).
+- **Tolerance.** `--tol` (default **15 min**) is now the *hours-shortfall*
+  threshold for `MANJAK_SATI`, not a per-timestamp tolerance.
+- **Sheets.** `KASNJENJE_ULAZI` / `RANIJI_IZLAZI` are replaced by
+  `DUPLIRANI_SATI` / `MANJAK_SATI`; `UPARENO` now shows claimed vs actual hours.
+
+Validated end-to-end against the real May workbooks: the reworked engine
+reproduces every worker HBIS named (4 duplicated-hours + 3 short-hours cases),
+labels each with its plant, and cuts total findings from 1,316 to 45.
+
 ## Validation reminder
 
-The `src/` modules are a faithful **reconstruction** from the original binary's
-bytecode. Signatures, constants, column maps, labels, and sheet names are exact;
-intra-function control flow is reconstructed. The CI functional test proves the
-pipeline runs and produces all seven sheets, but before relying on a rebuilt app
-for production data, run it against a known-good `Nalaz.xlsx` and confirm the
-seven output sheets match — or diff against a byte-exact decompile of the
-original `.pyc` files (see `SUMMARY.md`).
+The original `src/` parsing/labels were a faithful **reconstruction** from the
+binary's bytecode; the detection logic has since been deliberately changed (see
+above). The CI functional test proves the pipeline runs and produces all seven
+sheets with the expected findings and plant on every row. Before relying on a
+rebuilt app for a new month's data, spot-check a few `DUPLIRANI_SATI` /
+`MANJAK_SATI` rows against the source workbooks.

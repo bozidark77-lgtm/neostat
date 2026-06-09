@@ -1,15 +1,27 @@
 """
-analyze.py  —  RECONSTRUCTED SOURCE (from PyInstaller .pyc, Python 3.13)
+analyze.py  —  engine: reconcile IZVEŠTAJ DOBAVLJAČA vs BREZA gate events.
 
-Reconstructed from extracted bytecode. Signatures, column aliases, issue-type
-codes, Serbian messages, sheet names and the export column maps are EXACT.
-Per-function control flow is reconstructed from the referenced-name sequence and
-pandas idioms; verify against a 3.13 decompile of `analyze.pyc` for exact logic.
+Originally reconstructed from the PyInstaller .pyc of Neostat_Analiza.exe (the
+parsing helpers, column aliases, Serbian labels and styling are kept verbatim).
 
-Purpose: Compare a supplier report (IZVEŠTAJ DOBAVLJAČA) against BREZA gate
-access events. Build IN/OUT intervals from BREZA, match them to supplier rows
-within a time tolerance, flag irregularities (late in / early out / missing /
-wrong card / cross-plant overlap), and write a styled multi-sheet .xlsx.
+The detection logic was then reworked to fix the errors HBIS reported for May
+2026 that the original engine missed (see BUILD_SPEC.md → "Analysis changes"):
+
+  * DUPLIRANI_SATI            — same worker billed for overlapping hours on the
+                                same day at the same plant (e.g. 2× 8h). The
+                                original only checked BREZA and skipped same-plant
+                                overlaps, so these were invisible.
+  * MANJAK_SATI               — claimed hours (Sati rada) exceed the worker's
+                                actual BREZA presence for the day (late in, early
+                                out, or an exit/re-entry mid-shift). Replaces the
+                                old per-timestamp LATE_IN / EARLY_OUT checks,
+                                which flagged ~97% of rows as false positives
+                                (rounded supplier times vs exact gate times).
+  * pogon (plant) on every finding — taken from the supplier sheet name, which
+                                convert.py now preserves in a 'Pogon' column.
+
+Output: a styled multi-sheet .xlsx (REZIME, NEPRAVILNOSTI, DUPLIRANI_SATI,
+MANJAK_SATI, UPARENO, DOBAVLJAC_NORMALIZOVANO, BREZA_INTERVALI).
 """
 
 import argparse
@@ -21,8 +33,8 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font, PatternFill
 
-DEFAULT_SUPPLIER_CSV = "csv_output/IZVESTAJ DOBAVLJACA 03.2026.csv"
-DEFAULT_BREZA_CSV = "csv_output/AMS Team MART 2026 - BREZA.csv"
+DEFAULT_SUPPLIER_CSV = "csv_output/IZVESTAJ DOBAVLJACA 05.2026.csv"
+DEFAULT_BREZA_CSV = "csv_output/AMS Team 01.05-25.05.2026 - BREZA.csv"
 
 
 def _norm_col(s) -> str:
@@ -49,6 +61,15 @@ def _resolve_columns(df: pd.DataFrame, aliases: dict) -> dict:
             raise ValueError("Nedostaje kolona za '" + canonical + "'. Pronađene kolone: " + str(list(df.columns)))
         resolved[canonical] = hit
     return resolved
+
+
+def _optional_column(df: pd.DataFrame, *names):
+    """Return the real column name for the first alias present, or None."""
+    norm_to_real = {_norm_col(c): c for c in df.columns}
+    for n in names:
+        if _norm_col(n) in norm_to_real:
+            return norm_to_real[_norm_col(n)]
+    return None
 
 
 def _parse_datetime_robust(series: pd.Series) -> pd.Series:
@@ -96,6 +117,11 @@ def parse_supplier(path) -> pd.DataFrame:
     }
     df = _read_csv_auto(path)
     cols = _resolve_columns(df, aliases)
+    # Optional columns: 'Pogon' (plant, injected by convert.py from the sheet name)
+    # and 'Sati rada' (claimed hours). Both may be absent in older CSVs.
+    plant_col = _optional_column(df, "Pogon", "Pogon rada")
+    hours_col = _optional_column(df, "Sati rada", "Broj sati", "Sati")
+
     df = df.dropna(subset=[cols["name"], cols["date_in"], cols["time_in"],
                            cols["date_out"], cols["time_out"]], how="any").copy()
 
@@ -104,6 +130,8 @@ def parse_supplier(path) -> pd.DataFrame:
     out["name_key"] = out["employee_name"].map(norm_text)
     out["card_id"] = df[cols["card"]].map(norm_card)
     out["nzn"] = df[cols["nzn"]].astype(str).str.strip() if cols.get("nzn") else ""
+    out["plant"] = df[plant_col].astype(str).str.strip() if plant_col else ""
+    out["claimed_hours_raw"] = pd.to_numeric(df[hours_col], errors="coerce") if hours_col else pd.NA
     out["in_time"] = _parse_datetime_robust(df[cols["date_in"]].astype(str).str.strip()
                                             + " " + df[cols["time_in"]].astype(str).str.strip())
     out["out_time"] = _parse_datetime_robust(df[cols["date_out"]].astype(str).str.strip()
@@ -111,9 +139,13 @@ def parse_supplier(path) -> pd.DataFrame:
     out = out.dropna(subset=["in_time", "out_time"])
     # If out < in, assume the shift crosses midnight -> add a day
     out.loc[out["out_time"] < out["in_time"], "out_time"] += pd.Timedelta(days=1)
-    out = out.reset_index(drop=True)
+    # Claimed hours: prefer the reported 'Sati rada', else fall back to (out - in).
+    dur_h = (out["out_time"] - out["in_time"]).dt.total_seconds() / 3600.0
+    out["claimed_hours"] = pd.to_numeric(out["claimed_hours_raw"], errors="coerce").fillna(dur_h).round(2)
+    out = out.drop(columns=["claimed_hours_raw"]).reset_index(drop=True)
     out["row_id"] = range(len(out))
-    return out[["row_id", "employee_name", "name_key", "card_id", "nzn", "in_time", "out_time"]]
+    return out[["row_id", "employee_name", "name_key", "card_id", "nzn", "plant",
+                "in_time", "out_time", "claimed_hours"]]
 
 
 def parse_breza_events(path) -> pd.DataFrame:
@@ -183,116 +215,139 @@ def parse_breza(path) -> pd.DataFrame:
     if out.empty:
         return out
     out = out.reset_index(drop=True)
+    out["duration_h"] = ((out["out_time"] - out["in_time"]).dt.total_seconds() / 3600.0).round(2)
     out["row_id"] = range(len(out))
-    return out[["row_id"] + cols]
+    return out[["row_id"] + cols + ["duration_h"]]
 
 
-def match_supplier_to_breza(sup: pd.DataFrame, brz: pd.DataFrame, tol_min=5) -> pd.DataFrame:
-    """For each supplier row find the best BREZA interval (same card + date),
-    score by |in_delta| + |out_delta|; emit per-row irregularities."""
-    tol = pd.Timedelta(minutes=tol_min)
-    matched_event_ids = set()
-    out_rows = []
+def detect_supplier_overlaps(sup: pd.DataFrame) -> pd.DataFrame:
+    """Same worker billed for OVERLAPPING hours on the same day.
+
+    HBIS's core complaint: a worker appears twice for the same day with
+    overlapping (often identical) shifts — e.g. 2× 8h first shift — so the hours
+    are double-counted. We flag any pair of a worker's same-day rows whose time
+    ranges overlap, classified by plant:
+
+      * same plant      -> DUPLIRANI_SATI            (the duplicated-hours case)
+      * different plants -> OVERLAP_DIFFERENT_PLANTS  (can't be at two plants at once)
+    """
+    if sup is None or sup.empty:
+        return pd.DataFrame()
+    rows = []
+    work = sup.assign(_day=sup["in_time"].dt.date)
+    for (_nk, day), g in work.groupby(["name_key", "_day"], sort=False):
+        if len(g) < 2:
+            continue
+        recs = g.sort_values("in_time").to_dict("records")
+        for i in range(len(recs)):
+            for j in range(i + 1, len(recs)):
+                a, b = recs[i], recs[j]
+                if b["in_time"] >= a["out_time"]:   # sorted by in_time -> no overlap, and none after
+                    continue
+                same_plant = norm_text(a["plant"]) == norm_text(b["plant"])
+                h1 = float(a["claimed_hours"]) if pd.notna(a["claimed_hours"]) else 0.0
+                h2 = float(b["claimed_hours"]) if pd.notna(b["claimed_hours"]) else 0.0
+                if same_plant:
+                    issue, pogon = "DUPLIRANI_SATI", str(a["plant"])
+                    details = ("Duplirani/preklapajući sati na istom pogonu: "
+                               + str(round(h1, 2)) + "h + " + str(round(h2, 2)) + "h (ukupno "
+                               + str(round(h1 + h2, 2)) + "h za isti dan).")
+                else:
+                    issue, pogon = "OVERLAP_DIFFERENT_PLANTS", str(a["plant"]) + " / " + str(b["plant"])
+                    details = "Preklapanje rada na različitim pogonima za isti dan."
+                rows.append({
+                    "issue_type": issue,
+                    "pogon": pogon,
+                    "employee_name": a["employee_name"],
+                    "datum": day,
+                    "card_supplier": a["card_id"],
+                    "in_1": a["in_time"], "out_1": a["out_time"], "hours_1": round(h1, 2),
+                    "in_2": b["in_time"], "out_2": b["out_time"], "hours_2": round(h2, 2),
+                    "total_hours": round(h1 + h2, 2),
+                    "details": details,
+                })
+    return pd.DataFrame(rows)
+
+
+def match_supplier_to_breza(sup: pd.DataFrame, brz: pd.DataFrame, tol_min=15):
+    """Reconcile each supplier row against the worker's BREZA presence that day.
+
+    Returns (matched_df, issues_df).
+
+    For every supplier row we gather all BREZA intervals for the same card on the
+    same day and compare the CLAIMED hours to the ACTUAL presence (sum of interval
+    durations — so an exit/re-entry mid-shift correctly reduces the total). A
+    shortfall beyond the tolerance is MANJAK_SATI. No same-card events for the day
+    is MISSING_ON_BREZA, or WRONG_CARD_ID if the same person is there on another
+    card.
+    """
+    tol_h = tol_min / 60.0
+    matched = []
+    issues = []
+
+    brz = brz.copy()
+    if not brz.empty:
+        brz["day"] = brz["in_time"].dt.date
 
     for _, s in sup.iterrows():
         day = s["in_time"].date()
-        same_card = brz[(brz["card_id"] == s["card_id"])
-                        & (brz["in_time"].dt.date == day)]
+        claimed = float(s["claimed_hours"]) if pd.notna(s["claimed_hours"]) \
+            else (s["out_time"] - s["in_time"]).total_seconds() / 3600.0
+
+        same_card = brz[(brz["card_id"] == s["card_id"]) & (brz["day"] == day)] \
+            if not brz.empty else brz
 
         if same_card.empty:
-            # Same person + date present under a DIFFERENT card?
-            same_name = brz[(brz["name_key"] == s["name_key"])
-                            & (brz["in_time"].dt.date == day)]
+            same_name = brz[(brz["name_key"] == s["name_key"]) & (brz["day"] == day)] \
+                if not brz.empty else brz
             if not same_name.empty:
-                out_rows.append({
-                    "issue_type": "WRONG_CARD_ID",
-                    "employee_name": s["employee_name"],
-                    "supplier_card": s["card_id"],
-                    "breza_card": same_name.iloc[0]["card_id"],
-                    "supplier_in": s["in_time"],
-                    "supplier_out": s["out_time"],
+                issues.append({
+                    "issue_type": "WRONG_CARD_ID", "pogon": s["plant"],
+                    "employee_name": s["employee_name"], "datum": day,
+                    "card_supplier": s["card_id"], "card_breza": same_name.iloc[0]["card_id"],
+                    "claimed_hours": round(claimed, 2), "actual_hours": None, "hours_diff": None,
+                    "n_intervals": int(len(same_name)),
                     "details": "Isti radnik i datum postoje u BREZA, ali sa drugim ID kartice.",
                 })
             else:
-                out_rows.append({
-                    "issue_type": "MISSING_ON_BREZA",
-                    "employee_name": s["employee_name"],
-                    "supplier_card": s["card_id"],
-                    "supplier_in": s["in_time"],
-                    "supplier_out": s["out_time"],
+                issues.append({
+                    "issue_type": "MISSING_ON_BREZA", "pogon": s["plant"],
+                    "employee_name": s["employee_name"], "datum": day,
+                    "card_supplier": s["card_id"], "card_breza": None,
+                    "claimed_hours": round(claimed, 2), "actual_hours": None, "hours_diff": None,
+                    "n_intervals": 0,
                     "details": "Nema događaja u BREZA za isti ID kartice i isti datum.",
                 })
             continue
 
-        # pick best interval by combined timing delta
-        best = None
-        best_score = None
-        for _, b in same_card.iterrows():
-            in_delta = abs((s["in_time"] - b["in_time"]).total_seconds())
-            out_delta = abs((s["out_time"] - b["out_time"]).total_seconds())
-            score = in_delta + out_delta
-            if best_score is None or score < best_score:
-                best_score, best = score, b
-        b = best
-        in_delta_min = int(round((s["in_time"] - b["in_time"]).total_seconds() / 60))
-        out_delta_min = int(round((s["out_time"] - b["out_time"]).total_seconds() / 60))
+        actual = (same_card["out_time"] - same_card["in_time"]).dt.total_seconds().sum() / 3600.0
+        first_in = same_card["in_time"].min()
+        last_out = same_card["out_time"].max()
+        n_int = int(len(same_card))
+        diff = claimed - actual
 
-        common = {
-            "employee_name": s["employee_name"],
-            "supplier_card": s["card_id"],
-            "breza_card": b["card_id"],
-            "supplier_in": s["in_time"],
-            "breza_in": b["in_time"],
-            "supplier_out": s["out_time"],
-            "breza_out": b["out_time"],
-            "in_delta_min": in_delta_min,
-            "out_delta_min": out_delta_min,
-            "in_gate": b["in_gate"],
-            "out_gate": b["out_gate"],
-        }
-        out_rows.append(common)
+        matched.append({
+            "pogon": s["plant"], "employee_name": s["employee_name"],
+            "card_supplier": s["card_id"], "card_breza": s["card_id"], "datum": day,
+            "claimed_in": s["in_time"], "claimed_out": s["out_time"],
+            "first_in": first_in, "last_out": last_out,
+            "claimed_hours": round(claimed, 2), "actual_hours": round(actual, 2),
+            "hours_diff": round(diff, 2), "n_intervals": n_int,
+        })
 
-        if (s["in_time"] - b["in_time"]) > tol:
-            out_rows.append({
-                "issue_type": "LATE_IN",
-                "employee_name": s["employee_name"],
-                "supplier_card": s["card_id"], "breza_card": b["card_id"],
-                "supplier_in": s["in_time"], "breza_in": b["in_time"],
-                "details": "Kašnjenje ulaza: " + str(in_delta_min) + " min.",
-            })
-        if (b["out_time"] - s["out_time"]) > tol:
-            out_rows.append({
-                "issue_type": "EARLY_OUT",
-                "employee_name": s["employee_name"],
-                "supplier_card": s["card_id"], "breza_card": b["card_id"],
-                "supplier_out": s["out_time"], "breza_out": b["out_time"],
-                "details": "Raniji izlaz: " + str(abs(out_delta_min)) + " min.",
+        if diff > tol_h:
+            gap_note = (" Radnik je imao " + str(n_int) + " ulaza/izlaza (prekid u smeni).") if n_int > 1 else ""
+            issues.append({
+                "issue_type": "MANJAK_SATI", "pogon": s["plant"],
+                "employee_name": s["employee_name"], "datum": day,
+                "card_supplier": s["card_id"], "card_breza": s["card_id"],
+                "claimed_hours": round(claimed, 2), "actual_hours": round(actual, 2),
+                "hours_diff": round(diff, 2), "n_intervals": n_int,
+                "details": ("Prijavljeno " + str(round(claimed, 2)) + "h, a BREZA evidentira "
+                            + str(round(actual, 2)) + "h (manjak " + str(round(diff, 2)) + "h)." + gap_note),
             })
 
-    return pd.DataFrame(out_rows)
-
-
-def detect_overlaps(brz_intervals: pd.DataFrame) -> pd.DataFrame:
-    """Same person working overlapping intervals at different plants."""
-    if brz_intervals.empty:
-        return pd.DataFrame()
-    rows = []
-    df = brz_intervals.sort_values("in_time")
-    for name_key, g in df.groupby("name_key"):
-        g = g.sort_values("in_time")
-        prev = None
-        for _, cur in g.iterrows():
-            if prev is not None and cur["in_time"] < prev["out_time"] \
-                    and str(cur["plant_in"]) != str(prev["plant_in"]):
-                rows.append({
-                    "issue_type": "OVERLAP_DIFFERENT_PLANTS",
-                    "employee_name": cur["employee_name"],
-                    "plant_1": prev["plant_in"], "in_1": prev["in_time"], "out_1": prev["out_time"],
-                    "plant_2": cur["plant_in"], "in_2": cur["in_time"], "out_2": cur["out_time"],
-                    "details": "Preklapanje rada na različitim pogonima.",
-                })
-            prev = cur
-    return pd.DataFrame(rows)
+    return pd.DataFrame(matched), pd.DataFrame(issues)
 
 
 def _autosize_worksheet(writer, sheet_name, df, min_width=2, max_width=60):
@@ -325,113 +380,120 @@ def _format_worksheet(writer, sheet_name, df):
 
 # Internal issue code -> Serbian export label
 _ISSUE_LABELS = {
-    "LATE_IN": "KASNJENJE_ULAZ",
-    "EARLY_OUT": "RANIJI_IZLAZ",
+    "DUPLIRANI_SATI": "DUPLIRANI_SATI",
+    "MANJAK_SATI": "MANJAK_SATI",
+    "OVERLAP_DIFFERENT_PLANTS": "PREKLAPANJE_RAZLICITI_POGONI",
     "MISSING_ON_BREZA": "NEMA_U_BREZA_EVIDENCIJI",
     "WRONG_CARD_ID": "POGRESAN_ID_KARTICE",
-    "OVERLAP_DIFFERENT_PLANTS": "PREKLAPANJE_RAZLICITI_POGONI",
 }
 
 
-def _translate_issue_types(df):
-    if df.empty or "issue_type" not in df.columns:
-        return df
-    df = df.copy()
-    df["tip_nepravilnosti"] = df["issue_type"].map(_ISSUE_LABELS).fillna(df["issue_type"])
-    return df
+def _safe_select(df, cols, rename=None):
+    """Select `cols` (missing ones become empty) and rename for export."""
+    rename = rename or {}
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[rename.get(c, c) for c in cols])
+    return df.reindex(columns=cols).rename(columns=rename)
 
 
-def _rename_columns_for_export(df, mapping):
-    if df.empty:
-        return df
-    return df.rename(columns=mapping)
-
-
-def _build_timing_detail_sheets(matched, tol_min):
-    """Return (late_in_df, early_out_df) sorted worst-first, Serbian headers."""
-    late_cols = {"employee_name": "ime_prezime", "supplier_in": "ulaz_dobavljac",
-                 "breza_in": "ulaz_breza", "in_delta_min": "kasnjenje_min"}
-    early_cols = {"employee_name": "ime_prezime", "supplier_out": "izlaz_dobavljac",
-                  "breza_out": "izlaz_breza", "out_delta_min": "raniji_izlaz_min"}
-    if matched.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    late = matched[matched.get("in_delta_min", pd.Series(dtype=float)).notna()] \
-        [["employee_name", "supplier_in", "breza_in", "in_delta_min"]].copy()
-    late = late.rename(columns=late_cols).sort_values("kasnjenje_min", ascending=False).reset_index(drop=True)
-
-    early = matched[matched.get("out_delta_min", pd.Series(dtype=float)).notna()] \
-        [["employee_name", "supplier_out", "breza_out", "out_delta_min"]].copy()
-    early = early.rename(columns=early_cols).sort_values("raniji_izlaz_min", ascending=True).reset_index(drop=True)
-    return late, early
-
-
-def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
+def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=15):
     sup = parse_supplier(str(supplier_csv))
-    ev = parse_breza_events(str(breza_csv))      # noqa: F841 (kept for parity)
     brz = parse_breza(str(breza_csv))
 
-    matched = match_supplier_to_breza(sup, brz, tol_min=tol_min)
-    overlaps = detect_overlaps(brz)
+    overlaps = detect_supplier_overlaps(sup)
+    matched, match_issues = match_supplier_to_breza(sup, brz, tol_min=tol_min)
 
-    issues = pd.concat([_translate_issue_types(matched[matched.get("issue_type").notna()]
-                                               if "issue_type" in matched else pd.DataFrame()),
-                        _translate_issue_types(overlaps)], ignore_index=True) \
-        if not matched.empty else _translate_issue_types(overlaps)
+    issues = pd.concat([overlaps, match_issues], ignore_index=True, sort=False) \
+        if (not overlaps.empty or not match_issues.empty) else pd.DataFrame()
 
-    late, early = _build_timing_detail_sheets(matched, tol_min)
+    def _count(code):
+        if issues.empty or "issue_type" not in issues:
+            return 0
+        return int((issues["issue_type"] == code).sum())
 
-    n_issues = 0 if issues is None or issues.empty else len(issues)
+    n_matched = 0 if matched.empty else len(matched)
     summary = pd.DataFrame([
         ("Broj redova - izveštaj dobavljača", len(sup)),
         ("Broj intervala - BREZA", len(brz)),
-        ("Broj uparenih redova", int((matched.get("in_delta_min").notna()).sum()) if not matched.empty else 0),
-        ("Ukupno nepravilnosti", n_issues),
-        ("Kašnjenje ulaza", int((issues["issue_type"] == "LATE_IN").sum()) if n_issues else 0),
-        ("Raniji izlaz", int((issues["issue_type"] == "EARLY_OUT").sum()) if n_issues else 0),
-        ("Nema u BREZA evidenciji", int((issues["issue_type"] == "MISSING_ON_BREZA").sum()) if n_issues else 0),
-        ("Pogrešan ID kartice", int((issues["issue_type"] == "WRONG_CARD_ID").sum()) if n_issues else 0),
-        ("Preklapanje na različitim pogonima",
-         int((issues["issue_type"] == "OVERLAP_DIFFERENT_PLANTS").sum()) if n_issues else 0),
+        ("Broj uparenih redova", n_matched),
+        ("Ukupno nepravilnosti", 0 if issues.empty else len(issues)),
+        ("Duplirani sati (isti pogon)", _count("DUPLIRANI_SATI")),
+        ("Manjak sati (prijavljeno > BREZA)", _count("MANJAK_SATI")),
+        ("Preklapanje na različitim pogonima", _count("OVERLAP_DIFFERENT_PLANTS")),
+        ("Nema u BREZA evidenciji", _count("MISSING_ON_BREZA")),
+        ("Pogrešan ID kartice", _count("WRONG_CARD_ID")),
     ], columns=["metrika", "vrednost"])
 
-    issues_export = _rename_columns_for_export(issues, {
-        "tip_nepravilnosti": "oznaka_nepravilnosti", "employee_name": "ime_prezime",
-        "supplier_card": "kartica_dobavljac", "breza_card": "kartica_breza",
-        "supplier_in": "ulaz_dobavljac", "supplier_out": "izlaz_dobavljac",
-        "breza_in": "ulaz_breza", "breza_out": "izlaz_breza", "details": "opis",
-        "plant_1": "pogon_1", "in_1": "ulaz_1", "out_1": "izlaz_1",
-        "plant_2": "pogon_2", "in_2": "ulaz_2", "out_2": "izlaz_2",
-    }) if issues is not None and not issues.empty else pd.DataFrame()
+    # --- NEPRAVILNOSTI: one concise row per finding, with the plant ---
+    if not issues.empty:
+        nepr = issues.copy()
+        nepr["oznaka_nepravilnosti"] = nepr["issue_type"].map(_ISSUE_LABELS).fillna(nepr["issue_type"])
+    else:
+        nepr = pd.DataFrame()
+    nepravilnosti = _safe_select(
+        nepr,
+        ["oznaka_nepravilnosti", "pogon", "employee_name", "datum", "details"],
+        {"employee_name": "ime_prezime", "datum": "datum", "details": "opis"},
+    )
 
-    matched_export = _rename_columns_for_export(
-        matched[matched.get("in_delta_min").notna()] if not matched.empty else pd.DataFrame(), {
-            "employee_name": "ime_prezime", "supplier_card": "kartica_dobavljac",
-            "breza_card": "kartica_breza", "supplier_in": "ulaz_dobavljac",
-            "breza_in": "ulaz_breza", "supplier_out": "izlaz_dobavljac",
-            "breza_out": "izlaz_breza", "in_delta_min": "razlika_ulaz_min",
-            "out_delta_min": "razlika_izlaz_min", "in_gate": "kapija_ulaz", "out_gate": "kapija_izlaz",
-        })
+    # --- DUPLIRANI_SATI: the duplicated-hours detail (HBIS issue A) ---
+    dups = issues[issues["issue_type"] == "DUPLIRANI_SATI"] if not issues.empty else pd.DataFrame()
+    dupl_sheet = _safe_select(
+        dups,
+        ["pogon", "employee_name", "datum", "in_1", "out_1", "hours_1",
+         "in_2", "out_2", "hours_2", "total_hours", "details"],
+        {"employee_name": "ime_prezime", "in_1": "ulaz_1", "out_1": "izlaz_1", "hours_1": "sati_1",
+         "in_2": "ulaz_2", "out_2": "izlaz_2", "hours_2": "sati_2",
+         "total_hours": "ukupno_sati", "details": "opis"},
+    )
 
-    sup_export = _rename_columns_for_export(sup, {
-        "row_id": "redni_broj", "employee_name": "ime_prezime", "name_key": "kljuc_imena",
-        "card_id": "id_kartice", "nzn": "broj_nzn", "in_time": "ulaz", "out_time": "izlaz",
-    })
-    brz_export = _rename_columns_for_export(brz, {
-        "row_id": "redni_broj", "employee_name": "ime_prezime", "name_key": "kljuc_imena",
-        "card_id": "id_kartice", "in_time": "ulaz", "out_time": "izlaz",
-        "in_gate": "kapija_ulaz", "out_gate": "kapija_izlaz",
-        "plant_in": "pogon_ulaz", "plant_out": "pogon_izlaz",
-    })
+    # --- MANJAK_SATI: claimed vs actual hours (HBIS issue B), worst first ---
+    short = issues[issues["issue_type"] == "MANJAK_SATI"].copy() if not issues.empty else pd.DataFrame()
+    if not short.empty:
+        short = short.sort_values("hours_diff", ascending=False)
+    manjak_sheet = _safe_select(
+        short,
+        ["pogon", "employee_name", "datum", "claimed_hours", "actual_hours",
+         "hours_diff", "n_intervals", "details"],
+        {"employee_name": "ime_prezime", "claimed_hours": "sati_dobavljac",
+         "actual_hours": "sati_breza", "hours_diff": "manjak_sati",
+         "n_intervals": "broj_prolazaka", "details": "opis"},
+    )
+
+    # --- UPARENO: matched supplier <-> BREZA per day ---
+    upareno = _safe_select(
+        matched,
+        ["pogon", "employee_name", "card_supplier", "datum", "claimed_in", "claimed_out",
+         "first_in", "last_out", "claimed_hours", "actual_hours", "hours_diff", "n_intervals"],
+        {"employee_name": "ime_prezime", "card_supplier": "kartica", "claimed_in": "ulaz_dobavljac",
+         "claimed_out": "izlaz_dobavljac", "first_in": "prvi_ulaz_breza", "last_out": "poslednji_izlaz_breza",
+         "claimed_hours": "sati_dobavljac", "actual_hours": "sati_breza", "hours_diff": "razlika_sati",
+         "n_intervals": "broj_prolazaka"},
+    )
+
+    sup_export = _safe_select(
+        sup,
+        ["row_id", "pogon", "employee_name", "card_id", "nzn", "in_time", "out_time", "claimed_hours"],
+        {"row_id": "redni_broj", "employee_name": "ime_prezime", "card_id": "id_kartice",
+         "nzn": "broj_nzn", "in_time": "ulaz", "out_time": "izlaz", "claimed_hours": "sati_rada"},
+    )
+    brz_export = _safe_select(
+        brz,
+        ["row_id", "employee_name", "card_id", "in_time", "out_time", "duration_h",
+         "in_gate", "out_gate"],
+        {"row_id": "redni_broj", "employee_name": "ime_prezime", "card_id": "id_kartice",
+         "in_time": "ulaz", "out_time": "izlaz", "duration_h": "trajanje_sati",
+         "in_gate": "kapija_ulaz", "out_gate": "kapija_izlaz"},
+    )
 
     out_xlsx = Path(out_xlsx)
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         for name, frame in [
             ("REZIME", summary),
-            ("NEPRAVILNOSTI", issues_export),
-            ("UPARENO", matched_export),
-            ("KASNJENJE_ULAZI", late),
-            ("RANIJI_IZLAZI", early),
+            ("NEPRAVILNOSTI", nepravilnosti),
+            ("DUPLIRANI_SATI", dupl_sheet),
+            ("MANJAK_SATI", manjak_sheet),
+            ("UPARENO", upareno),
             ("DOBAVLJAC_NORMALIZOVANO", sup_export),
             ("BREZA_INTERVALI", brz_export),
         ]:
@@ -448,7 +510,8 @@ def main():
     ap.add_argument("--breza", default=DEFAULT_BREZA_CSV,
                     help="Putanja do CSV fajla BREZA evidencije (default: " + DEFAULT_BREZA_CSV + ")")
     ap.add_argument("--out", default="Nalaz.xlsx", help="Naziv izlaznog Excel fajla")
-    ap.add_argument("--tol", type=int, default=5, help="Tolerancija u minutima")
+    ap.add_argument("--tol", type=int, default=15,
+                    help="Tolerancija manjka sati, u minutima (default: 15)")
     args = ap.parse_args()
     out = generate_report(args.supplier, args.breza, args.out, tol_min=args.tol)
     print("Završeno: " + str(Path(out).resolve()))
