@@ -13,6 +13,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+# The report uses Serbian labels (č, š, …). On a console that defaults to a
+# non-UTF-8 codepage (Windows cp1252) printing them raises UnicodeEncodeError,
+# so force UTF-8 on stdout/stderr where the stream supports it.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 

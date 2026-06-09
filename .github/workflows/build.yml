@@ -24,6 +24,10 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      # The Windows console defaults to cp1252, which can't encode the Serbian
+      # output (č, š, …). UTF-8 mode makes stdout/stderr UTF-8 on every runner.
+      PYTHONUTF8: '1'
     strategy:
       fail-fast: false       # one platform failing must not abort the others
       matrix:
