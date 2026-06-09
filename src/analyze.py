@@ -269,7 +269,7 @@ def detect_supplier_overlaps(sup: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def match_supplier_to_breza(sup: pd.DataFrame, brz: pd.DataFrame, tol_min=15):
+def match_supplier_to_breza(sup: pd.DataFrame, brz: pd.DataFrame, tol_min=5):
     """Reconcile each supplier row against the worker's BREZA presence that day.
 
     Returns (matched_df, issues_df).
@@ -396,7 +396,7 @@ def _safe_select(df, cols, rename=None):
     return df.reindex(columns=cols).rename(columns=rename)
 
 
-def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=15):
+def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
     sup = parse_supplier(str(supplier_csv))
     brz = parse_breza(str(breza_csv))
 
@@ -510,8 +510,8 @@ def main():
     ap.add_argument("--breza", default=DEFAULT_BREZA_CSV,
                     help="Putanja do CSV fajla BREZA evidencije (default: " + DEFAULT_BREZA_CSV + ")")
     ap.add_argument("--out", default="Nalaz.xlsx", help="Naziv izlaznog Excel fajla")
-    ap.add_argument("--tol", type=int, default=15,
-                    help="Tolerancija manjka sati, u minutima (default: 15)")
+    ap.add_argument("--tol", type=int, default=5,
+                    help="Tolerancija manjka sati, u minutima (default: 5)")
     args = ap.parse_args()
     out = generate_report(args.supplier, args.breza, args.out, tol_min=args.tol)
     print("Završeno: " + str(Path(out).resolve()))

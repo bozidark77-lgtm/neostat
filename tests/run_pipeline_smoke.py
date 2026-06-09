@@ -72,7 +72,7 @@ def main() -> None:
             if not p.exists() or p.stat().st_size == 0:
                 fail("conversion produced an empty CSV: " + p.name)
 
-        # 2) CSV -> styled 7-sheet report (15-min hours tolerance)
+        # 2) CSV -> styled 7-sheet report (5-min hours-shortfall tolerance)
         generate_report(str(sup_csv), str(brz_csv), str(out_xlsx))
         if not out_xlsx.exists():
             fail("generate_report did not write " + out_xlsx.name)

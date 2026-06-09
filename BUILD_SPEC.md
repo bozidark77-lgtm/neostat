@@ -176,8 +176,10 @@ Supporting changes:
   `convert.py` now writes a `Pogon` column from the sheet name (stripping the
   `Izvestaj` prefix and `(2)` copy-marker), and `analyze.py` threads it through.
 - **Claimed hours.** `analyze.py` reads `Sati rada` (falling back to out−in).
-- **Tolerance.** `--tol` (default **15 min**) is now the *hours-shortfall*
-  threshold for `MANJAK_SATI`, not a per-timestamp tolerance.
+- **Tolerance.** `--tol` (default **5 min**) is the *hours-shortfall* threshold
+  for `MANJAK_SATI` — the original 5-minute value, but now applied to total daily
+  hours instead of per-timestamp. On the May data anything from 0–29 min yields
+  the same result; the margin only matters for trivial edge cases in future months.
 - **Sheets.** `KASNJENJE_ULAZI` / `RANIJI_IZLAZI` are replaced by
   `DUPLIRANI_SATI` / `MANJAK_SATI`; `UPARENO` now shows claimed vs actual hours.
 
