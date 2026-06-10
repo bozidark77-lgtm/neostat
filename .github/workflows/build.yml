@@ -1,44 +1,39 @@
-name: Build Desktop Apps
+name: Build Windows App
 
-# Builds the Neostat_Analiza desktop app from source for Windows and macOS.
-# PyInstaller cannot cross-compile (it embeds the host OS's interpreter), so
-# each target is built on its own matching runner:
-#   - Windows  -> windows-latest          -> Neostat_Analiza.exe
-#   - macOS    -> macos-14 (Apple Silicon) -> Neostat_Analiza.app (zipped)
+# Builds the Neostat_Analiza desktop app (Windows .exe) from source with
+# PyInstaller, runs the smoke + functional tests, and publishes the .exe:
+#   - every push to main  -> rolling "latest" pre-release (newest dev build)
+#   - every v* tag         -> a permanent, versioned GitHub Release
 #
-# macOS is Apple Silicon (arm64) only. To also ship an Intel build, add an
-# `os: macos-13` entry to the matrix below.
+# PyInstaller cannot cross-compile (it embeds the host OS's interpreter), so the
+# .exe is built on a Windows runner. To build the macOS .app or a Linux binary,
+# run the same spec locally on that OS (see BUILD_SPEC.md / CONTRIBUTING.md).
 
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]          # tag push (e.g. v1.0.0) also publishes a Release
+    tags: [ 'v*' ]          # tag push (e.g. v1.0.0) publishes a versioned Release
   pull_request:
     branches: [ main ]
   workflow_dispatch:         # manual "Run workflow" button
 
 permissions:
-  contents: write            # needed to create a Release on tag builds
+  contents: write            # publish/update Releases on main pushes and tags
+
+# Serialize runs per ref so two quick pushes to main can't race on the rolling
+# "latest" release (delete-then-recreate below). Runs queue rather than cancel.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
+    name: Build Windows (x64)
+    runs-on: windows-latest
     env:
       # The Windows console defaults to cp1252, which can't encode the Serbian
-      # output (č, š, …). UTF-8 mode makes stdout/stderr UTF-8 on every runner.
+      # output (č, š, …). UTF-8 mode makes stdout/stderr UTF-8 on the runner.
       PYTHONUTF8: '1'
-    strategy:
-      fail-fast: false       # one platform failing must not abort the others
-      matrix:
-        include:
-          - os: windows-latest
-            label: Windows (x64)
-            asset: Neostat_Analiza-windows
-          - os: macos-14
-            label: macOS (Apple Silicon)
-            asset: Neostat_Analiza-macos
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,44 +61,57 @@ jobs:
           python tests/make_fixtures.py
           python tests/run_pipeline_smoke.py
 
-      - name: Package macOS .app
-        if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/Neostat_Analiza.app" "dist/${{ matrix.asset }}.zip"
-
-      - name: Upload artifact (Windows)
-        if: runner.os == 'Windows'
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
+          name: Neostat_Analiza-windows
           path: dist/Neostat_Analiza.exe
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload artifact (macOS)
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}.zip
           if-no-files-found: error
           retention-days: 30
 
   release:
     name: Publish Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Release only on pushes to main (rolling "latest") and v* tags (versioned).
+    # Pull requests build for validation but never publish a Release.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     steps:
-      - name: Download all build artifacts
+      - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
+          name: Neostat_Analiza-windows
           path: artifacts
 
-      - name: Publish GitHub Release
+      # --- versioned release (v* tag push) ------------------------------------
+      - name: Publish versioned Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/**/*.exe
-            artifacts/**/*.zip
+          files: artifacts/Neostat_Analiza.exe
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # --- rolling "latest" pre-release (push to main / merged PR) ------------
+      # The Releases API does not move an existing git tag, so drop the old
+      # `latest` release + tag first, then recreate it pointing at this commit.
+      - name: Refresh rolling "latest" release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete latest --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Publish "latest" pre-release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Latest build (main)
+          prerelease: true
+          files: artifacts/Neostat_Analiza.exe
+          fail_on_unmatched_files: true
+          body: >
+            Rolling build of the newest commit on `main` (${{ github.sha }}),
+            updated automatically on every push. For a stable download, use a
+            versioned release instead.

@@ -39,15 +39,19 @@ writes the report.
 
 ## Download a build
 
-Prebuilt apps are produced by CI for every push and attached to tagged releases:
+CI builds the Windows app on every push to `main` and attaches it to a GitHub
+**Release** — no need to build it yourself:
 
-- **Windows:** `Neostat_Analiza.exe` (single file, double-click to run)
-- **macOS (Apple Silicon):** `Neostat_Analiza-macos.zip` → unzip →
-  `Neostat_Analiza.app`. The app is unsigned, so the first launch needs
-  **right-click → Open → Open** (see `BUILD_SPEC.md` → *macOS code signing*).
+- **Latest dev build:** the rolling **`latest`** pre-release under **Releases**
+  always carries the newest `.exe` built from `main`.
+- **Stable build:** tagged **Releases** (`v*`) carry a fixed, versioned `.exe`.
 
-Find them under **Actions → latest run → Artifacts**, or under **Releases** for
-tagged versions.
+Either way the download is `Neostat_Analiza.exe` — a single file, double-click to
+run. The `.exe` is also kept as a build **artifact** on each Actions run (30-day
+retention).
+
+> **macOS / Linux:** CI builds the Windows target only. Build the `.app` or a
+> Linux binary locally with the steps below — PyInstaller can't cross-compile.
 
 ## Build it yourself
 
@@ -60,8 +64,9 @@ pyinstaller --noconfirm --clean Neostat_Analiza.spec
 ```
 
 PyInstaller cannot cross-compile, so build each target on its own OS. The CI
-workflow (`.github/workflows/build.yml`) does this on `windows-latest` and
-`macos-14`. Full details and release instructions are in **`BUILD_SPEC.md`**.
+workflow (`.github/workflows/build.yml`) builds the Windows `.exe` on
+`windows-latest`; build the macOS `.app` and the Linux binary locally. Full
+details and release instructions are in **`BUILD_SPEC.md`**.
 
 ## Tests
 
@@ -70,8 +75,14 @@ python tests/make_fixtures.py        # write sample supplier + BREZA workbooks
 python tests/run_pipeline_smoke.py   # convert → analyze → assert the 7 sheets
 ```
 
-The same two steps run in CI on Windows and macOS, so every build is proven to
-produce a valid report end-to-end.
+The same two steps run in CI on Windows, so every build is proven to produce a
+valid report end-to-end.
+
+## Contributing
+
+Setup, the test gate, build/CI details, and project conventions — including
+**instructions for AI agents** — are in
+**[`CONTRIBUTING.md`](CONTRIBUTING.md)**.
 
 ## Provenance
 

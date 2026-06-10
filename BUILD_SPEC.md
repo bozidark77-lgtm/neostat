@@ -1,14 +1,15 @@
 # Build Specification — Neostat_Analiza
 
 Reproducible build of the **AMS – Analiza izveštaja** desktop tool (Neostat™)
-from recovered source into single-file desktop apps for **Windows and macOS**,
-via GitHub Actions.
+from recovered source into single-file desktop apps. **CI (GitHub Actions)
+builds, tests, and publishes the Windows `.exe`**; the macOS `.app` and the
+Linux binary are produced by running the same spec locally on those systems.
 
 ## Repository layout
 
 ```
 neostat/
-├── .github/workflows/build.yml   CI: build Windows .exe + macOS .app, publish on tag
+├── .github/workflows/build.yml   CI: build + test Windows .exe, publish Release on main/tag
 ├── src/
 │   ├── app.py        tkinter GUI launcher (entry point, ConvertLauncherApp)
 │   ├── analyze.py    engine: parse → match → detect overlaps → write .xlsx
@@ -28,7 +29,7 @@ neostat/
 └── BUILD_SPEC.md           this file
 ```
 
-`tkinter` ships with CPython on the Windows and macOS runners, so it is **not**
+`tkinter` ships with CPython on Windows and macOS, so it is **not**
 in `requirements.txt`. On Linux you install it via the system package
 `python3-tk`.
 
@@ -37,16 +38,16 @@ in `requirements.txt`. On Linux you install it via the system package
 | Property        | Windows                          | macOS                                  |
 |-----------------|----------------------------------|----------------------------------------|
 | Output          | `dist/Neostat_Analiza.exe`       | `dist/Neostat_Analiza.app` (zipped)    |
-| Runner          | `windows-latest`                 | `macos-14` (Apple Silicon, arm64)      |
+| Built by        | CI on `windows-latest`           | locally on a Mac (no CI runner)        |
 | Mode            | one-file, windowed (no console)  | one-file `.app` bundle, windowed       |
 | Python          | 3.13                             | 3.13                                   |
 | Packager        | PyInstaller ≥ 6.6                | PyInstaller ≥ 6.6                       |
 | Runtime deps    | pandas ≥ 2.2.3, openpyxl ≥ 3.1.2, stdlib tkinter                          ||
 
 PyInstaller **does not cross-compile** — it embeds the interpreter of the OS it
-runs on. So the `.exe` must be built on Windows and the `.app` on macOS; the CI
-matrix runs each on its matching runner. (Run the same spec on Linux and you get
-an ELF binary instead.)
+runs on. So the `.exe` must be built on Windows and the `.app` on macOS. CI
+builds only the Windows target; build the `.app` on a Mac and the Linux ELF
+binary on Linux from the same spec (see *Local builds* below).
 
 `openpyxl` is declared as a PyInstaller **hidden import** because pandas loads
 the Excel engine lazily by name (`engine="openpyxl"`), which static analysis can
@@ -54,52 +55,61 @@ miss.
 
 ### macOS architecture
 
-The macOS job builds on `macos-14` (**Apple Silicon / arm64**) only — the build
-runs natively on M1/M2/M3+ Macs. To additionally ship an Intel build, add an
-`os: macos-13` entry to the matrix in `build.yml`; it will produce a separate
-x86_64 `.app`.
+A local PyInstaller build produces a `.app` for the architecture of the Mac it
+runs on — Apple Silicon (arm64) on M1/M2/M3+, x86_64 on Intel. To ship both,
+build on each. There is no macOS CI runner, so the `.app` is not built or
+published automatically.
 
 ## CI pipeline (`.github/workflows/build.yml`)
 
+CI builds the **Windows `.exe`** only (see *Build targets*).
+
 **Triggers**
-- push to `main` — build both platforms + upload artifacts
-- pull request to `main` — build (validation only)
-- push of a `v*` tag (e.g. `v1.0.0`) — build + publish a GitHub Release with both
-  the `.exe` and the macOS `.zip` attached
+- push to `main` (including a merged PR) — build + test, then publish/update the
+  rolling `latest` pre-release with the new `.exe`
+- pull request to `main` — build + test (validation only; no Release)
+- push of a `v*` tag (e.g. `v1.0.0`) — build + test, then publish a permanent,
+  versioned GitHub Release with the `.exe` attached
 - `workflow_dispatch` — manual run from the Actions tab
 
-**`build` job** (matrix: `windows-latest`, `macos-14`)
+Runs are serialized per ref (`concurrency`) so two quick pushes to `main` can't
+race on the rolling release.
+
+**`build` job** (`windows-latest`)
 1. **Checkout** the repo.
 2. **Set up Python 3.13** with pip caching.
 3. **Install** `requirements.txt` + PyInstaller.
 4. **Build** via `pyinstaller --noconfirm --clean Neostat_Analiza.spec`.
 5. **Import smoke test** — import `analyze` and `convert` to catch packaging-
-   independent breakage early (the GUI is not launched; runners are headless).
+   independent breakage early (the GUI is not launched; the runner is headless).
 6. **Functional pipeline test** — generate sample workbooks, run the real
    convert → analyze path, and assert the report has the seven expected sheets
    with the expected irregularity counts.
-7. **Package** — on macOS, zip the `.app` with `ditto` (preserves the bundle's
-   symlinks/metadata). On Windows the `.exe` is already a single file.
-8. **Upload artifact** — `Neostat_Analiza-windows` (the `.exe`) and
-   `Neostat_Analiza-macos` (the `.app` zip).
+7. **Upload artifact** — `Neostat_Analiza-windows` (the `.exe`), 30-day retention.
 
-**`release` job** (only on `v*` tags)
-- Downloads both build artifacts and publishes a single GitHub Release with the
-  `.exe` and the macOS `.zip` attached, using auto-generated notes.
+**`release` job** (push events only)
+- **`v*` tag** → publishes a versioned GitHub Release with the `.exe` attached,
+  using auto-generated notes.
+- **push to `main`** → drops the previous `latest` release + tag (the Releases
+  API won't move an existing tag) and recreates a `latest` **pre-release** at the
+  new commit with the fresh `.exe`. Pull requests never reach this job.
 
 **Permissions:** the workflow requests `contents: write` so the release step can
-create/attach a Release. Nothing else is granted.
+create/attach Releases. Nothing else is granted.
 
 ## Releasing
+
+Every push to `main` already publishes the newest `.exe` to the rolling `latest`
+pre-release. For a permanent, versioned Release, push a tag:
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-The tag push builds both platforms and publishes a Release with the `.exe` and
-the macOS `.zip` attached. Without a tag, the build still runs and the artifacts
-are downloadable from the run page (30-day retention).
+The tag push builds the Windows `.exe` and publishes a versioned Release with it
+attached. The `.exe` is also downloadable from each run's artifacts (30-day
+retention).
 
 ## macOS code signing (Gatekeeper)
 
@@ -112,7 +122,8 @@ launch (the app was downloaded from the internet). To open it:
 
 For a frictionless install you'd sign + notarize with an Apple Developer ID
 (\$99/yr) — that needs certificate/secret setup and is intentionally out of
-scope for this build. The hooks are easy to add to the macOS job later.
+scope for this build. You'd run those steps as part of a macOS build — locally,
+or in a macOS CI job if one is added later.
 
 ## Local builds
 
