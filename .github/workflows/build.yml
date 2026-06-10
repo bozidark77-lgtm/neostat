@@ -1,0 +1,109 @@
+name: Build Desktop Apps
+
+# Builds the Neostat_Analiza desktop app from source for Windows and macOS.
+# PyInstaller cannot cross-compile (it embeds the host OS's interpreter), so
+# each target is built on its own matching runner:
+#   - Windows  -> windows-latest          -> Neostat_Analiza.exe
+#   - macOS    -> macos-14 (Apple Silicon) -> Neostat_Analiza.app (zipped)
+#
+# macOS is Apple Silicon (arm64) only. To also ship an Intel build, add an
+# `os: macos-13` entry to the matrix below.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]          # tag push (e.g. v1.0.0) also publishes a Release
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:         # manual "Run workflow" button
+
+permissions:
+  contents: write            # needed to create a Release on tag builds
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    env:
+      # The Windows console defaults to cp1252, which can't encode the Serbian
+      # output (č, š, …). UTF-8 mode makes stdout/stderr UTF-8 on every runner.
+      PYTHONUTF8: '1'
+    strategy:
+      fail-fast: false       # one platform failing must not abort the others
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows (x64)
+            asset: Neostat_Analiza-windows
+          - os: macos-14
+            label: macOS (Apple Silicon)
+            asset: Neostat_Analiza-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.6"
+
+      - name: Build
+        run: pyinstaller --noconfirm --clean Neostat_Analiza.spec
+
+      - name: Import smoke test (no GUI)
+        run: python -c "import sys; sys.path.insert(0, 'src'); import analyze, convert; print('modules import OK')"
+
+      - name: Functional pipeline test (convert -> analyze -> 7-sheet report)
+        run: |
+          python tests/make_fixtures.py
+          python tests/run_pipeline_smoke.py
+
+      - name: Package macOS .app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Neostat_Analiza.app" "dist/${{ matrix.asset }}.zip"
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/Neostat_Analiza.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

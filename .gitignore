@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# PyInstaller build output
+/build/
+/dist/
+*.manifest
+
+# Generated test fixtures (recreated by tests/make_fixtures.py)
+tests/fixtures/*.xlsx
+tests/fixtures/*.csv
+
+# Generated reports / intermediate CSVs
+Nalaz.xlsx
+csv_output/
+
+# Your real input data — names, card IDs, gate logs. Drop files in data/ and
+# they stay out of git (the folder's README is kept so the convention is visible).
+/data/*
+!/data/README.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
