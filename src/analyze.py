@@ -7,18 +7,18 @@ parsing helpers, column aliases, Serbian labels and styling are kept verbatim).
 The detection logic was then reworked to fix the errors HBIS reported for May
 2026 that the original engine missed (see BUILD_SPEC.md → "Analysis changes"):
 
-  * DUPLIRANI_SATI            — same worker billed for overlapping hours on the
-                                same day at the same plant (e.g. 2× 8h). The
-                                original only checked BREZA and skipped same-plant
-                                overlaps, so these were invisible.
-  * MANJAK_SATI               — claimed hours (Sati rada) exceed the worker's
-                                actual BREZA presence for the day (late in, early
-                                out, or an exit/re-entry mid-shift). Replaces the
-                                old per-timestamp LATE_IN / EARLY_OUT checks,
-                                which flagged ~97% of rows as false positives
-                                (rounded supplier times vs exact gate times).
+  * DUPLIRANI_SATI             — same worker billed for overlapping hours on the
+                                 same day at the same plant (e.g. 2× 8h). The
+                                 original only checked BREZA and skipped same-plant
+                                 overlaps, so these were invisible.
+  * MANJAK_SATI                — claimed hours (Sati rada) exceed the worker's
+                                 actual BREZA presence for the day (late in, early
+                                 out, or an exit/re-entry mid-shift). Replaces the
+                                 old per-timestamp LATE_IN / EARLY_OUT checks,
+                                 which flagged ~97% of rows as false positives
+                                 (rounded supplier times vs exact gate times).
   * pogon (plant) on every finding — taken from the supplier sheet name, which
-                                convert.py now preserves in a 'Pogon' column.
+                                 convert.py now preserves in a 'Pogon' column.
 
 Output: a styled multi-sheet .xlsx (REZIME, NEPRAVILNOSTI, DUPLIRANI_SATI,
 MANJAK_SATI, UPARENO, DOBAVLJAC_NORMALIZOVANO, BREZA_INTERVALI).
@@ -139,18 +139,35 @@ def parse_plant_from_gate(gate) -> str:
 
 def parse_supplier(path) -> pd.DataFrame:
     aliases = {
-        "card":     ["Broj kartice"],
-        "name":     ["Ime I prezime", "Ime i prezime"],
-        "date_in":  ["Datum pocetka rada (format mm/dd/yyyy)"],
-        "time_in":  ["Vreme pocetka rada (fomat hh:mm)", "Vreme pocetka rada (format hh:mm)"],
-        "date_out": ["Datum zavrsetka rada (format mm/dd/yyyy)"],
-        "time_out": ["Vreme zavrsetka rada (fomat hh:mm)", "Vreme zavrsetka rada (format hh:mm)"],
-        "nzn":      ["Broj NZN-a"],
+        "card":     ["Broj kartice", "Broj kartice"],
+        "name":     ["Ime I prezime", "Ime i prezime", "Ime i Prezime", "Ime I Prezime"],
+        "date_in":  [
+            "Datum pocetka rada (format mm/dd/yyyy)", 
+            "Datum početka rada (format mm/dd/yyyy)",
+            "Datum pocetka rada", "Datum početka rada",
+            "Datum pocetka", "Datum početka", "Datum"
+        ],
+        "time_in":  [
+            "Vreme pocetka rada (fomat hh:mm)", "Vreme pocetka rada (format hh:mm)", 
+            "Vreme početka rada (fomat hh:mm)", "Vreme početka rada (format hh:mm)",
+            "Vreme pocetka rada", "Vreme početka rada", "Vreme pocetka", "Vreme početka"
+        ],
+        "date_out": [
+            "Datum zavrsetka rada (format mm/dd/yyyy)", 
+            "Datum završetka rada (format mm/dd/yyyy)",
+            "Datum zavrsetka rada", "Datum završetka rada",
+            "Datum zavrsetka", "Datum završetka"
+        ],
+        "time_out": [
+            "Vreme zavrsetka rada (fomat hh:mm)", "Vreme zavrsetka rada (format hh:mm)", 
+            "Vreme završetka rada (fomat hh:mm)", "Vreme završetka rada (format hh:mm)",
+            "Vreme zavrsetka rada", "Vreme završetka rada", "Vreme zavrsetka", "Vreme završetka"
+        ],
+        "nzn":      ["Broj NZN-a", "Broj NZN", "Broj nzn-a", "Broj nzn", "NZN", "nzn"],
     }
     df = _read_csv_auto(path)
     cols = _resolve_columns(df, aliases)
-    # Optional columns: 'Pogon' (plant, injected by convert.py from the sheet name)
-    # and 'Sati rada' (claimed hours). Both may be absent in older CSVs.
+    
     plant_col = _optional_column(df, "Pogon", "Pogon rada")
     hours_col = _optional_column(df, "Sati rada", "Broj sati", "Sati")
 
@@ -169,9 +186,9 @@ def parse_supplier(path) -> pd.DataFrame:
     out["out_time"] = _parse_datetime_robust(df[cols["date_out"]].astype(str).str.strip()
                                              + " " + df[cols["time_out"]].astype(str).str.strip())
     out = out.dropna(subset=["in_time", "out_time"])
-    # If out < in, assume the shift crosses midnight -> add a day
+    
     out.loc[out["out_time"] < out["in_time"], "out_time"] += pd.Timedelta(days=1)
-    # Claimed hours: prefer the reported 'Sati rada', else fall back to (out - in).
+    
     dur_h = (out["out_time"] - out["in_time"]).dt.total_seconds() / 3600.0
     out["claimed_hours"] = pd.to_numeric(out["claimed_hours_raw"], errors="coerce").fillna(dur_h).round(2)
     out = out.drop(columns=["claimed_hours_raw"]).reset_index(drop=True)
@@ -253,16 +270,6 @@ def parse_breza(path) -> pd.DataFrame:
 
 
 def detect_supplier_overlaps(sup: pd.DataFrame) -> pd.DataFrame:
-    """Same worker billed for OVERLAPPING hours on the same day.
-
-    HBIS's core complaint: a worker appears twice for the same day with
-    overlapping (often identical) shifts — e.g. 2× 8h first shift — so the hours
-    are double-counted. We flag any pair of a worker's same-day rows whose time
-    ranges overlap, classified by plant:
-
-      * same plant      -> DUPLIRANI_SATI            (the duplicated-hours case)
-      * different plants -> OVERLAP_DIFFERENT_PLANTS  (can't be at two plants at once)
-    """
     if sup is None or sup.empty:
         return pd.DataFrame()
     rows = []
@@ -274,7 +281,7 @@ def detect_supplier_overlaps(sup: pd.DataFrame) -> pd.DataFrame:
         for i in range(len(recs)):
             for j in range(i + 1, len(recs)):
                 a, b = recs[i], recs[j]
-                if b["in_time"] >= a["out_time"]:   # sorted by in_time -> no overlap, and none after
+                if b["in_time"] >= a["out_time"]:
                     continue
                 same_plant = norm_text(a["plant"]) == norm_text(b["plant"])
                 h1 = float(a["claimed_hours"]) if pd.notna(a["claimed_hours"]) else 0.0
@@ -302,17 +309,6 @@ def detect_supplier_overlaps(sup: pd.DataFrame) -> pd.DataFrame:
 
 
 def match_supplier_to_breza(sup: pd.DataFrame, brz: pd.DataFrame, tol_min=5):
-    """Reconcile each supplier row against the worker's BREZA presence that day.
-
-    Returns (matched_df, issues_df).
-
-    For every supplier row we gather all BREZA intervals for the same card on the
-    same day and compare the CLAIMED hours to the ACTUAL presence (sum of interval
-    durations — so an exit/re-entry mid-shift correctly reduces the total). A
-    shortfall beyond the tolerance is MANJAK_SATI. No same-card events for the day
-    is MISSING_ON_BREZA, or WRONG_CARD_ID if the same person is there on another
-    card.
-    """
     tol_h = tol_min / 60.0
     matched = []
     issues = []
@@ -410,7 +406,6 @@ def _format_worksheet(writer, sheet_name, df):
         cell.alignment = align
 
 
-# Internal issue code -> Serbian export label
 _ISSUE_LABELS = {
     "DUPLIRANI_SATI": "DUPLIRANI_SATI",
     "MANJAK_SATI": "MANJAK_SATI",
@@ -421,7 +416,6 @@ _ISSUE_LABELS = {
 
 
 def _safe_select(df, cols, rename=None):
-    """Select `cols` (missing ones become empty) and rename for export."""
     rename = rename or {}
     if df is None or df.empty:
         return pd.DataFrame(columns=[rename.get(c, c) for c in cols])
@@ -456,7 +450,6 @@ def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
         ("Pogrešan ID kartice", _count("WRONG_CARD_ID")),
     ], columns=["metrika", "vrednost"])
 
-    # --- NEPRAVILNOSTI: one concise row per finding, with the plant ---
     if not issues.empty:
         nepr = issues.copy()
         nepr["oznaka_nepravilnosti"] = nepr["issue_type"].map(_ISSUE_LABELS).fillna(nepr["issue_type"])
@@ -468,7 +461,6 @@ def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
         {"employee_name": "ime_prezime", "datum": "datum", "details": "opis"},
     )
 
-    # --- DUPLIRANI_SATI: the duplicated-hours detail (HBIS issue A) ---
     dups = issues[issues["issue_type"] == "DUPLIRANI_SATI"] if not issues.empty else pd.DataFrame()
     dupl_sheet = _safe_select(
         dups,
@@ -479,7 +471,6 @@ def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
          "total_hours": "ukupno_sati", "details": "opis"},
     )
 
-    # --- MANJAK_SATI: claimed vs actual hours (HBIS issue B), worst first ---
     short = issues[issues["issue_type"] == "MANJAK_SATI"].copy() if not issues.empty else pd.DataFrame()
     if not short.empty:
         short = short.sort_values("hours_diff", ascending=False)
@@ -492,7 +483,6 @@ def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
          "n_intervals": "broj_prolazaka", "details": "opis"},
     )
 
-    # --- UPARENO: matched supplier <-> BREZA per day ---
     upareno = _safe_select(
         matched,
         ["pogon", "employee_name", "card_supplier", "datum", "claimed_in", "claimed_out",
