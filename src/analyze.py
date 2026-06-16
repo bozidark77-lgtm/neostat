@@ -44,8 +44,40 @@ def _norm_col(s) -> str:
 
 
 def _read_csv_auto(path) -> pd.DataFrame:
-    # python engine + sep=None sniffs the delimiter; utf-8-sig handles BOM
-    return pd.read_csv(str(path), sep=None, engine="python", encoding="utf-8-sig", dtype=str)
+    # 1. Učitavamo fajl sa python engine-om bez predefinisanog zaglavlja (kao sirove podatke)
+    df_raw = pd.read_csv(str(path), sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=None)
+    
+    if df_raw.empty:
+        return df_raw
+
+    # Ključne reči koje pouzdano ukazuju na to da je reč o stvarnom redu sa kolonama
+    target_keywords = {"broj kartice", "ime i prezime", "kapija", "smer"}
+    header_row_index = 0
+
+    # 2. Skeniramo prvih 15 redova da pronađemo gde počinje stvarna tabela
+    for idx, row in df_raw.head(15).iterrows():
+        # Normalizujemo sve vrednosti u trenutnom redu radi bezbednog poređenja
+        row_norms = [str(val).strip().lower() for val in row.values if pd.notna(val)]
+        
+        # Ako red sadrži bilo koji od naših ključnih naziva kolona, to je to!
+        if any(any(keyword in val for keyword in target_keywords) for val in row_norms):
+            header_row_index = idx
+            break
+
+    # 3. Ako je pravo zaglavlje pomereno naniže, rekonstruišemo DataFrame
+    if header_row_index > 0:
+        # Postavljamo pronađeni red kao nazive kolona
+        columns_labels = df_raw.iloc[header_row_index].values
+        # Uzimamo sve podatke ispod tog reda
+        df_cleaned = df_raw.iloc[header_row_index + 1:].copy()
+        df_cleaned.columns = columns_labels
+        df_cleaned.reset_index(drop=True, inplace=True)
+        return df_cleaned
+    else:
+        # Ako je tabela regularna i počinje od prvog reda (indeks 0)
+        df_raw.columns = df_raw.iloc[0].values
+        df_raw = df_raw.iloc[1:].reset_index(drop=True)
+        return df_raw
 
 
 def _resolve_columns(df: pd.DataFrame, aliases: dict) -> dict:
