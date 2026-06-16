@@ -108,14 +108,14 @@ class ConvertLauncherApp:
     def _pick_supplier(self):
         p = filedialog.askopenfilename(
             title="Izaberi IZVESTAJ DOBAVLJACA xlsx", initialdir=str(self.base_dir),
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+            filetypes=[("Podržani fajlovi", "*.xlsx *.xls *.csv *.txt"), ("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv *.txt"), ("All files", "*.*")]
         if p:
             self.supplier_var.set(p)
 
     def _pick_ams(self):
         p = filedialog.askopenfilename(
             title="Izaberi BREZA xlsx", initialdir=str(self.base_dir),
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+           filetypes=[("Podržani fajlovi", "*.xlsx *.xls *.csv *.txt"), ("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv *.txt"), ("All files", "*.*")]
         if p:
             self.ams_var.set(p)
 
@@ -130,19 +130,23 @@ class ConvertLauncherApp:
         if p:
             self.output_var.set(p)
 
-    @staticmethod
+  @staticmethod
     def _validate_xlsx(path_str, label):
         p = Path(path_str).expanduser().resolve()
         if not p.exists():
             raise ValueError(label + ": fajl ne postoji.")
-        if not p.is_file() or p.suffix.lower() != ".xlsx":
-            raise ValueError(label + ": mora biti .xlsx fajl.")
+        
+        # Dozvoljene ekstenzije za analizu podataka
+        allowed_extensions = {".xlsx", ".xls", ".csv", ".txt"}
+        if not p.is_file() or p.suffix.lower() not in allowed_extensions:
+            raise ValueError(label + ": mora biti Excel (.xlsx, .xls) ili tekstualni (.csv, .txt) fajl.")
         return p
 
     def _run_convert_for_file(self, xlsx_path):
-        csv_path = xlsx_path.with_suffix(".csv")
+        # Dodajemo '_temp' u naziv kako ne bismo prepisali originalni fajl ako je korisnik uneo .csv
+        csv_path = xlsx_path.parent / (xlsx_path.stem + "_temp.csv")
         convert_xlsx_to_csv(str(xlsx_path), str(csv_path))
-        print("Konvertovano: " + xlsx_path.name + " -> " + csv_path.name)
+        print("Konvertovano i normalizovano: " + xlsx_path.name + " -> " + csv_path.name)
         return csv_path
 
     def _analyze(self):
