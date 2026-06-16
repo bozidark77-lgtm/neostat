@@ -1,16 +1,9 @@
 """
-convert.py  —  RECONSTRUCTED SOURCE (from PyInstaller .pyc, Python 3.13)
+convert.py  —  Universal Multi-Format Data Normalization Engine (Neostat™).
 
-Reconstructed from the extracted bytecode: function signatures, constants,
-column aliases and string literals are exact (read from the code objects).
-The control flow inside each function is reconstructed from the sequence of
-referenced names + standard pandas idioms and may differ in minor detail from
-the original. For byte-exact source, run `convert.pyc` through a 3.13-aware
-decompiler (see README).
-
-Purpose: Convert supplier / BREZA .xlsx files into normalized .csv, with two
-special readers: one for the multi-sheet "IZVEŠTAJ DOBAVLJAČA" workbook and one
-robust reader for "AMS Team … BREZA" exports whose header row is not row 0.
+Handles conversion and dynamic header alignment for Excel (.xlsx, .xls) and 
+textual (.csv, .txt) files. Automatically resolves duplicate and empty column 
+names to prevent Pandas reindexing errors.
 """
 
 import argparse
@@ -67,7 +60,8 @@ def _drop_columns_empty_in_first_row(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _is_ams_team_file(input_path: Path) -> bool:
-    return "ams team" in _norm_text(input_path.stem)
+    stem = _norm_text(input_path.stem)
+    return ("ams team" in stem) or ("breza" in stem)
 
 
 def _is_supplier_file(input_path: Path) -> bool:
@@ -86,49 +80,62 @@ _SUPPLIER_ALIASES = {
 
 
 def _plant_from_sheet(sheet_name) -> str:
-    """Derive the plant (pogon) from a supplier sheet name.
-
-    The supplier workbook keeps one sheet per plant, e.g. 'Izvestaj Aglomeracija',
-    'Izvestaj VP REMONT(2)'. Strip the leading 'Izvestaj' and any trailing '(2)'
-    copy-marker so we get 'Aglomeracija' / 'VP REMONT'. This is the only place the
-    plant is recorded, so it must be preserved into the CSV for analyze.py.
-    """
     s = str(sheet_name).strip()
     s = re.sub(r"^izve[sš]taj\s*", "", s, flags=re.IGNORECASE)  # drop 'Izvestaj' prefix
     s = re.sub(r"\s*\(\d+\)\s*$", "", s)                        # drop trailing '(2)'
     return s.strip()
 
 
+def _make_headers_unique(raw_labels) -> list:
+    """Helper to eliminate empty or duplicated column names dynamically."""
+    clean_labels = []
+    seen = set()
+    for idx, col in enumerate(raw_labels):
+        col_str = str(col).strip() if pd.notna(col) else ""
+        
+        # Ako je naziv kolone prazan, dajemo unikatno ime
+        if col_str == "" or col_str.lower().startswith("unnamed"):
+            col_str = f"PraznaKolona_{idx}"
+            
+        # Razrešavanje duplikata (npr. ako postoje dva 'Datum zavrsetka rada')
+        original_col = col_str
+        counter = 1
+        while col_str in seen:
+            col_str = f"{original_col}.{counter}"
+            counter += 1
+            
+        seen.add(col_str)
+        clean_labels.append(col_str)
+    return clean_labels
+
+
 def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
     """Read every sheet of the supplier workbook, dynamically find the header row,
-    and concatenate non-empty rows. Each row is tagged with its plant (from the sheet name).
+    ensure unique columns, and concatenate non-empty rows.
     """
     sheets = pd.read_excel(input_path, sheet_name=None, engine="openpyxl", header=None)
     frames = []
     
-    # Ključni izrazi koji signaliziraju stvarni red sa zaglavljem
-    wanted_supplier_keywords = {"ime i prezime", "broj kartice", "datum pocetka rada", "vreme pocetka rada"}
+    wanted_supplier_keywords = {"ime", "kartice", "kartica", "pocetka", "početka", "zavrsetka", "završetka", "nzn"}
     
     for _name, sdf_raw in sheets.items():
         if sdf_raw.empty:
             continue
             
-        # 1. Dinamička detekcija reda zaglavlja (skeniramo prvih 15 redova)
         header_row = 0
         for i in range(min(15, len(sdf_raw))):
-            cells = {_norm_text(v) for v in sdf_raw.iloc[i].tolist() if pd.notna(v)}
-            # Ako red sadrži bar jednu ključnu reč specifičnu za izveštaj dobavljača
-            if any(k in cells for k in wanted_supplier_keywords) or any(any(k in c for k in wanted_supplier_keywords) for c in cells):
+            cells = {str(v).strip().lower() for v in sdf_raw.iloc[i].tolist() if pd.notna(v)}
+            if any(any(kw in cell for kw in wanted_supplier_keywords) for cell in cells):
                 header_row = i
                 break
                 
-        # 2. Ponovo formiramo DataFrame za taj list koristeći detektovani red kao kolone
-        columns_labels = sdf_raw.iloc[header_row].values
+        raw_labels = sdf_raw.iloc[header_row].values
+        clean_labels = _make_headers_unique(raw_labels)
+        
         sdf = sdf_raw.iloc[header_row + 1:].copy()
-        sdf.columns = columns_labels
+        sdf.columns = clean_labels
         sdf.reset_index(drop=True, inplace=True)
         
-        # 3. Čišćenje i filtriranje praznih redova
         sdf = sdf.dropna(how="all").copy()
         if not sdf.empty:
             sdf["Pogon"] = _plant_from_sheet(_name)
@@ -139,7 +146,6 @@ def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
         
     df = pd.concat(frames, ignore_index=True, sort=False)
     
-    # Ostatak originalne logike za čišćenje i validaciju polja
     for c in df.columns:
         if pd.api.types.is_object_dtype(df[c]):
             df[c] = df[c].astype(str).str.strip().replace(("", "nan", "None", "NaT"), pd.NA)
@@ -152,7 +158,6 @@ def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-# BREZA / AMS-Team column aliases
 _AMS_ALIASES = {
     "card": ["broj kartice"],
     "name": ["ime i prezime"],
@@ -163,71 +168,64 @@ _AMS_ALIASES = {
 
 
 def _read_ams_sheet_robust(input_path: Path, sheet) -> pd.DataFrame:
-    """
-    AMS Team BREZA exports often have title rows before the real header.
-    Scan the first ~30 rows for the row that contains the expected headers,
-    then re-read using that row as the header.
-    """
     raw = pd.read_excel(input_path, sheet_name=sheet, engine="openpyxl", header=None)
     if raw.empty:
         return raw
     wanted = {_norm_text(n) for names in _AMS_ALIASES.values() for n in names}
     header_row = None
     for i in range(min(30, len(raw))):
-        cells = {_norm_text(v) for v in raw.iloc[i].tolist()}
-        # need at least the card + datetime + direction-ish columns present
+        cells = {_norm_text(v) for v in raw.iloc[i].tolist() if pd.notna(v)}
         if any(w in cells for w in wanted) and len(cells & wanted) >= 2:
             header_row = i
             break
     if header_row is None:
         header_row = 0
-    df = pd.read_excel(input_path, sheet_name=sheet, engine="openpyxl", skiprows=header_row)
+        
+    raw_labels = raw.iloc[header_row].values
+    clean_labels = _make_headers_unique(raw_labels)
+    
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = clean_labels
+    df.reset_index(drop=True, inplace=True)
+    
     df = df.dropna(how="all")
     df = df.fillna("")
     df = df.astype(str)
-    # drop helper / unnamed columns
-    df = df[[c for c in df.columns if not _norm_text(c).startswith("unnamed")]].copy()
+    df = df[[c for c in df.columns if not _norm_text(c).startswith("praznakolona")]].copy()
     return df.reset_index(drop=True)
 
 
 def convert_xlsx_to_csv(input_path, output_path, sheet=0, sep=","):
-    """Univerzalni adapter: prima .xlsx, .csv ili .txt, normalizuje podatke 
-    i upisuje ih u finalni privremeni UTF-8-SIG CSV fajl koji analyze.py očekuje.
-    """
+    """Universal multi-format data parser and normalizer."""
     input_path = Path(input_path)
     output_path = Path(output_path)
     ext = input_path.suffix.lower()
 
-    # --- SCENARIO 1: ULAZNI FAJL JE VEĆ CSV ILI TXT ---
     if ext in [".csv", ".txt"]:
-        # Ako je fajl već tekstualni, koristimo našu robusnu funkciju za automatsku detekciju
-        # koja se nalazi u analyze.py, ili je ovde pozivamo direktno preko pandas-a:
-        df = pd.read_csv(str(input_path), sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=None)
-        
-        # Pošto analyze.py očekuje kolonu 'Pogon' (za izveštaj dobavljača), 
-        # a CSV ima samo jedan list, injektujemo naziv fajla kao ime pogona ako je u pitanju dobavljač
-        if _is_supplier_file(input_path):
-            # Pokušavamo da nađemo zaglavlje u prvih 15 redova
-            wanted_keywords = {"ime", "kartice", "pocetka", "početka", "zavrsetka", "završetka", "nzn"}
+        df_raw = pd.read_csv(str(input_path), sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=None)
+        if df_raw.empty:
+            df = df_raw
+        else:
             header_row = 0
-            for i in range(min(15, len(df))):
-                cells = {str(v).strip().lower() for v in df.iloc[i].tolist() if pd.notna(v)}
+            wanted_supplier_keywords = {"ime", "kartice", "pocetka", "početka", "zavrsetka", "završetka", "nzn"}
+            
+            for i in range(min(15, len(df_raw))):
+                cells = {str(v).strip().lower() for v in df_raw.iloc[i].tolist() if pd.notna(v)}
                 if any(any(kw in cell for kw in wanted_supplier_keywords) for cell in cells):
                     header_row = i
                     break
             
-            columns_labels = df.iloc[header_row].values
-            df_cleaned = df.iloc[header_row + 1:].copy()
-            df_cleaned.columns = columns_labels
+            raw_labels = df_raw.iloc[header_row].values
+            clean_labels = _make_headers_unique(raw_labels)
+            
+            df_cleaned = df_raw.iloc[header_row + 1:].copy()
+            df_cleaned.columns = clean_labels
             df_cleaned = df_cleaned.dropna(how="all").copy()
-            df_cleaned["Pogon"] = _plant_from_sheet(input_path.stem)
+            
+            if _is_supplier_file(input_path):
+                df_cleaned["Pogon"] = _plant_from_sheet(input_path.stem)
             df = df_cleaned.reset_index(drop=True)
-        else:
-            # Ako je u pitanju BREZA (.csv), prepuštamo analyze.py-u da ga očisti kroz njegovu logiku,
-            # ovde ga samo prepisujemo u privremeni direktorijum radi konzistentnosti
-            pass
 
-    # --- SCENARIO 2: ULAZNI FAJL JE EXCEL (.XLSX ILI .XLS) ---
     elif ext in [".xlsx", ".xls"]:
         if _is_supplier_file(input_path):
             df = _read_supplier_all_sheets(input_path)
@@ -236,21 +234,20 @@ def convert_xlsx_to_csv(input_path, output_path, sheet=0, sep=","):
         else:
             df = pd.read_excel(input_path, sheet_name=sheet, engine="openpyxl")
             df = _drop_columns_empty_in_first_row(df)
-            
     else:
-        raise ValueError(f"Format fajla '{ext}' nije podržan za analizu unutar Neostat sistema.")
+        raise ValueError(f"Format fajla '{ext}' nije podržan unutar Neostat sistema.")
 
-    # Upisivanje u finalni CSV fajl koji je standardizovan za analitički endžin
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig", sep=sep)
     return output_path
+
 
 def main():
     ap = argparse.ArgumentParser(description="Convert XLSX to CSV.")
     ap.add_argument("input", help="Path to .xlsx file or folder containing .xlsx files")
     ap.add_argument("-o", "--output", help="Output file (for single input) or output folder")
     ap.add_argument("-s", "--sheet", default="0", help="Sheet name or index (default: 0)")
-    ap.add_argument("--sep", default=",", help="CSV separator (default: ','). Example: ';'")
+    ap.add_argument("--sep", default=",", help="CSV separator (default: ',')")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -260,15 +257,16 @@ def main():
     sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
 
     if inp.is_file():
-        if inp.suffix.lower() != ".xlsx":
-            raise ValueError("Input file must be .xlsx")
+        allowed = {".xlsx", ".xls", ".csv", ".txt"}
+        if inp.suffix.lower() not in allowed:
+            raise ValueError("Input file must be .xlsx, .xls, .csv, or .txt")
         out = Path(args.output) if args.output else inp.with_suffix(".csv")
         convert_xlsx_to_csv(inp, out, sheet=sheet, sep=args.sep)
         print("Converted: " + str(inp) + " -> " + str(out))
     else:
-        files = sorted(inp.glob("*.xlsx"))
+        files = sorted([f for f in inp.glob("*") if f.suffix.lower() in [".xlsx", ".xls", ".csv", ".txt"]])
         if not files:
-            print("No .xlsx files found.")
+            print("No supported files found.")
             return
         outdir = Path(args.output) if args.output else inp
         outdir.mkdir(parents=True, exist_ok=True)
