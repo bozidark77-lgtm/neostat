@@ -44,37 +44,27 @@ def _norm_col(s) -> str:
 
 
 def _read_csv_auto(path) -> pd.DataFrame:
-    # 1. Učitavamo fajl sa python engine-om bez predefinisanog zaglavlja (kao sirove podatke)
     df_raw = pd.read_csv(str(path), sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=None)
     
     if df_raw.empty:
         return df_raw
 
-    # Ključne reči koje pouzdano ukazuju na to da je reč o stvarnom redu sa kolonama
     target_keywords = {"broj kartice", "ime i prezime", "kapija", "smer"}
     header_row_index = 0
 
-    # 2. Skeniramo prvih 15 redova da pronađemo gde počinje stvarna tabela
     for idx, row in df_raw.head(15).iterrows():
-        # Normalizujemo sve vrednosti u trenutnom redu radi bezbednog poređenja
         row_norms = [str(val).strip().lower() for val in row.values if pd.notna(val)]
-        
-        # Ako red sadrži bilo koji od naših ključnih naziva kolona, to je to!
         if any(any(keyword in val for keyword in target_keywords) for val in row_norms):
             header_row_index = idx
             break
 
-    # 3. Ako je pravo zaglavlje pomereno naniže, rekonstruišemo DataFrame
     if header_row_index > 0:
-        # Postavljamo pronađeni red kao nazive kolona
         columns_labels = df_raw.iloc[header_row_index].values
-        # Uzimamo sve podatke ispod tog reda
         df_cleaned = df_raw.iloc[header_row_index + 1:].copy()
         df_cleaned.columns = columns_labels
         df_cleaned.reset_index(drop=True, inplace=True)
         return df_cleaned
     else:
-        # Ako je tabela regularna i počinje od prvog reda (indeks 0)
         df_raw.columns = df_raw.iloc[0].values
         df_raw = df_raw.iloc[1:].reset_index(drop=True)
         return df_raw
@@ -104,12 +94,32 @@ def _optional_column(df: pd.DataFrame, *names):
     return None
 
 
-def _parse_datetime_robust(series: pd.Series) -> pd.Series:
+def _parse_datetime_robust(series: pd.Series, is_supplier=False) -> pd.Series:
+    """Pametno izolovanje formata: razrešava konflikt između američkog formata 
+    dobavljača (MM/DD/YYYY) i evropskog formata BREZA evidencije (DD.MM.YYYY).
+    """
     s = series.astype(str).str.strip()
-    out = pd.to_datetime(s, errors="coerce", format="mixed")
+    
+    if is_supplier:
+        # Dobavljač: prvo MESEC, pa DAN (podržava crtice iz Excela i kose crte)
+        out = pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S")
+        alt = pd.to_datetime(s, errors="coerce", format="%m/%d/%Y %H:%M:%S")
+        alt2 = pd.to_datetime(s, errors="coerce", format="%m/%d/%Y %H:%M")
+        alt3 = pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M")
+        out = out.fillna(alt).fillna(alt2).fillna(alt3)
+    else:
+        # BREZA: prvo DAN, pa MESEC
+        out = pd.to_datetime(s, errors="coerce", format="%d.%m.%Y %H:%M:%S")
+        alt = pd.to_datetime(s, errors="coerce", format="%d.%m.%Y %H:%M")
+        alt2 = pd.to_datetime(s, errors="coerce", format="%d/%m/%Y %H:%M:%S")
+        alt3 = pd.to_datetime(s, errors="coerce", format="%d/%m/%Y %H:%M")
+        out = out.fillna(alt).fillna(alt2).fillna(alt3)
+        
+    # Ako išta ostane neprepoznato, koristimo mixed režim kao fail-safe varijantu
     if out.isna().any():
-        alt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-        out = out.fillna(alt)
+        fallback = pd.to_datetime(s, errors="coerce", format="mixed")
+        out = out.fillna(fallback)
+        
     return out
 
 
@@ -181,12 +191,16 @@ def parse_supplier(path) -> pd.DataFrame:
     out["nzn"] = df[cols["nzn"]].astype(str).str.strip() if cols.get("nzn") else ""
     out["plant"] = df[plant_col].astype(str).str.strip() if plant_col else ""
     out["claimed_hours_raw"] = pd.to_numeric(df[hours_col], errors="coerce") if hours_col else pd.NA
-    out["in_time"] = _parse_datetime_robust(df[cols["date_in"]].astype(str).str.strip()
-                                            + " " + df[cols["time_in"]].astype(str).str.strip())
-    out["out_time"] = _parse_datetime_robust(df[cols["date_out"]].astype(str).str.strip()
-                                             + " " + df[cols["time_out"]].astype(str).str.strip())
-    out = out.dropna(subset=["in_time", "out_time"])
     
+    # Prosleđujemo is_supplier=True za tačno mapiranje meseca i dana
+    out["in_time"] = _parse_datetime_robust(df[cols["date_in"]].astype(str).str.strip()
+                                            + " " + df[cols["time_in"]].astype(str).str.strip(), 
+                                            is_supplier=True)
+    out["out_time"] = _parse_datetime_robust(df[cols["date_out"]].astype(str).str.strip()
+                                             + " " + df[cols["time_out"]].astype(str).str.strip(), 
+                                             is_supplier=True)
+    
+    out = out.dropna(subset=["in_time", "out_time"])
     out.loc[out["out_time"] < out["in_time"], "out_time"] += pd.Timedelta(days=1)
     
     dur_h = (out["out_time"] - out["in_time"]).dt.total_seconds() / 3600.0
@@ -224,7 +238,10 @@ def parse_breza_events(path) -> pd.DataFrame:
             return "OUT"
         return "OTHER"
     out["direction"] = df[cols["dir"]].map(_dir)
-    out["event_time"] = pd.to_datetime(df[cols["dt"]], errors="coerce", dayfirst=True)
+    
+    # Prosleđujemo is_supplier=False za standardni evropski format (DD.MM.YYYY)
+    out["event_time"] = _parse_datetime_robust(df[cols["dt"]], is_supplier=False)
+    
     out = out.dropna(subset=["event_time"])
     out = out[out["direction"].isin(["IN", "OUT"])]
     out = out.drop_duplicates(subset=["name_key", "card_id", "direction", "event_time", "gate"])
@@ -236,7 +253,6 @@ def parse_breza_events(path) -> pd.DataFrame:
 
 
 def parse_breza(path) -> pd.DataFrame:
-    """Pair consecutive IN/OUT events per card into work intervals."""
     ev = parse_breza_events(path)
     rows = []
     for card_id, g in ev.groupby("card_id", sort=True):
@@ -508,6 +524,24 @@ def generate_report(supplier_csv, breza_csv, out_xlsx, tol_min=5):
          "in_gate": "kapija_ulaz", "out_gate": "kapija_izlaz"},
     )
 
+    # =========================================================================
+    # KONAČNA BLINDAŽA FORMATIRANJA: DD.MM.YYYY
+    # Pretvaramo sve interne Pandas datume u čist tekstualni format pre upisa
+    # u Excel. Ovo sprečava Windows locale da preokrene prikaz na računaru.
+    # =========================================================================
+    for df_frame in [nepravilnosti, dupl_sheet, manjak_sheet, upareno]:
+        if not df_frame.empty and "datum" in df_frame.columns:
+            df_frame["datum"] = pd.to_datetime(df_frame["datum"]).dt.strftime("%d.%m.%Y")
+
+    for col in ["ulaz", "izlaz"]:
+        if not sup_export.empty and col in sup_export.columns:
+            sup_export[col] = pd.to_datetime(sup_export[col]).dt.strftime("%d.%m.%Y %H:%M:%S")
+        if not brz_export.empty and col in brz_export.columns:
+            brz_export[col] = pd.to_datetime(brz_export[col]).dt.strftime("%d.%m.%Y %H:%M:%S")
+
+    # =========================================================================
+    # UPISIVANJE U FINALNI EXCEL FAJL
+    # =========================================================================
     out_xlsx = Path(out_xlsx)
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         for name, frame in [
