@@ -191,22 +191,59 @@ def _read_ams_sheet_robust(input_path: Path, sheet) -> pd.DataFrame:
 
 
 def convert_xlsx_to_csv(input_path, output_path, sheet=0, sep=","):
-    """Dispatch to the correct reader by filename, then write a UTF-8-SIG CSV."""
+    """Univerzalni adapter: prima .xlsx, .csv ili .txt, normalizuje podatke 
+    i upisuje ih u finalni privremeni UTF-8-SIG CSV fajl koji analyze.py očekuje.
+    """
     input_path = Path(input_path)
     output_path = Path(output_path)
+    ext = input_path.suffix.lower()
 
-    if _is_supplier_file(input_path):
-        df = _read_supplier_all_sheets(input_path)
-    elif _is_ams_team_file(input_path):
-        df = _read_ams_sheet_robust(input_path, sheet)
+    # --- SCENARIO 1: ULAZNI FAJL JE VEĆ CSV ILI TXT ---
+    if ext in [".csv", ".txt"]:
+        # Ako je fajl već tekstualni, koristimo našu robusnu funkciju za automatsku detekciju
+        # koja se nalazi u analyze.py, ili je ovde pozivamo direktno preko pandas-a:
+        df = pd.read_csv(str(input_path), sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=None)
+        
+        # Pošto analyze.py očekuje kolonu 'Pogon' (za izveštaj dobavljača), 
+        # a CSV ima samo jedan list, injektujemo naziv fajla kao ime pogona ako je u pitanju dobavljač
+        if _is_supplier_file(input_path):
+            # Pokušavamo da nađemo zaglavlje u prvih 15 redova
+            wanted_keywords = {"ime", "kartice", "pocetka", "početka", "zavrsetka", "završetka", "nzn"}
+            header_row = 0
+            for i in range(min(15, len(df))):
+                cells = {str(v).strip().lower() for v in df.iloc[i].tolist() if pd.notna(v)}
+                if any(any(kw in cell for kw in wanted_supplier_keywords) for cell in cells):
+                    header_row = i
+                    break
+            
+            columns_labels = df.iloc[header_row].values
+            df_cleaned = df.iloc[header_row + 1:].copy()
+            df_cleaned.columns = columns_labels
+            df_cleaned = df_cleaned.dropna(how="all").copy()
+            df_cleaned["Pogon"] = _plant_from_sheet(input_path.stem)
+            df = df_cleaned.reset_index(drop=True)
+        else:
+            # Ako je u pitanju BREZA (.csv), prepuštamo analyze.py-u da ga očisti kroz njegovu logiku,
+            # ovde ga samo prepisujemo u privremeni direktorijum radi konzistentnosti
+            pass
+
+    # --- SCENARIO 2: ULAZNI FAJL JE EXCEL (.XLSX ILI .XLS) ---
+    elif ext in [".xlsx", ".xls"]:
+        if _is_supplier_file(input_path):
+            df = _read_supplier_all_sheets(input_path)
+        elif _is_ams_team_file(input_path):
+            df = _read_ams_sheet_robust(input_path, sheet)
+        else:
+            df = pd.read_excel(input_path, sheet_name=sheet, engine="openpyxl")
+            df = _drop_columns_empty_in_first_row(df)
+            
     else:
-        df = pd.read_excel(input_path, sheet_name=sheet, engine="openpyxl")
-        df = _drop_columns_empty_in_first_row(df)
+        raise ValueError(f"Format fajla '{ext}' nije podržan za analizu unutar Neostat sistema.")
 
+    # Upisivanje u finalni CSV fajl koji je standardizovan za analitički endžin
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig", sep=sep)
     return output_path
-
 
 def main():
     ap = argparse.ArgumentParser(description="Convert XLSX to CSV.")
