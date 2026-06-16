@@ -101,7 +101,6 @@ def _plant_from_sheet(sheet_name) -> str:
 
 def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
     """Read every sheet of the supplier workbook, dynamically find the header row,
-
     and concatenate non-empty rows. Each row is tagged with its plant (from the sheet name).
     """
     sheets = pd.read_excel(input_path, sheet_name=None, engine="openpyxl", header=None)
@@ -140,39 +139,11 @@ def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
         
     df = pd.concat(frames, ignore_index=True, sort=False)
     
-    # Ostatak originalne logike za čišćenje i validaciju polja ostaje netaknut
+    # Ostatak originalne logike za čišćenje i validaciju polja
     for c in df.columns:
         if pd.api.types.is_object_dtype(df[c]):
             df[c] = df[c].astype(str).str.strip().replace(("", "nan", "None", "NaT"), pd.NA)
             
-    subset = [_find_column(df, {k: v}) for k, v in _SUPPLIER_ALIASES.items()
-              if _find_column(df, {k: v}) is not None]
-    if subset:
-        df = df.dropna(subset=subset, how="any")
-    df = df.dropna(axis=1, how="all")
-    return df.reset_index(drop=True)
-
-    Each row is tagged with its plant (from the sheet name) in a 'Pogon' column,
-    because the report is organised one plant per sheet and that is the only place
-    the plant of work is recorded.
-    """
-    sheets = pd.read_excel(input_path, sheet_name=None, engine="openpyxl")
-    frames = []
-    for _name, sdf in sheets.items():
-        if sdf.empty:
-            continue
-        sdf = sdf.dropna(how="all").copy()
-        if not sdf.empty:
-            sdf["Pogon"] = _plant_from_sheet(_name)
-            frames.append(sdf)
-    if not frames:
-        return pd.DataFrame()
-    df = pd.concat(frames, ignore_index=True, sort=False)
-    # Clean object columns: strip, blank out sentinel strings
-    for c in df.columns:
-        if pd.api.types.is_object_dtype(df[c]):
-            df[c] = df[c].astype(str).str.strip().replace(("", "nan", "None", "NaT"), pd.NA)
-    # Require the key supplier fields to be present before keeping a row
     subset = [_find_column(df, {k: v}) for k, v in _SUPPLIER_ALIASES.items()
               if _find_column(df, {k: v}) is not None]
     if subset:
