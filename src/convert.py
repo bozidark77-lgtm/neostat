@@ -100,7 +100,57 @@ def _plant_from_sheet(sheet_name) -> str:
 
 
 def _read_supplier_all_sheets(input_path: Path) -> pd.DataFrame:
-    """Read every sheet of the supplier workbook and concatenate non-empty rows.
+    """Read every sheet of the supplier workbook, dynamically find the header row,
+
+    and concatenate non-empty rows. Each row is tagged with its plant (from the sheet name).
+    """
+    sheets = pd.read_excel(input_path, sheet_name=None, engine="openpyxl", header=None)
+    frames = []
+    
+    # Ključni izrazi koji signaliziraju stvarni red sa zaglavljem
+    wanted_supplier_keywords = {"ime i prezime", "broj kartice", "datum pocetka rada", "vreme pocetka rada"}
+    
+    for _name, sdf_raw in sheets.items():
+        if sdf_raw.empty:
+            continue
+            
+        # 1. Dinamička detekcija reda zaglavlja (skeniramo prvih 15 redova)
+        header_row = 0
+        for i in range(min(15, len(sdf_raw))):
+            cells = {_norm_text(v) for v in sdf_raw.iloc[i].tolist() if pd.notna(v)}
+            # Ako red sadrži bar jednu ključnu reč specifičnu za izveštaj dobavljača
+            if any(k in cells for k in wanted_supplier_keywords) or any(any(k in c for k in wanted_supplier_keywords) for c in cells):
+                header_row = i
+                break
+                
+        # 2. Ponovo formiramo DataFrame za taj list koristeći detektovani red kao kolone
+        columns_labels = sdf_raw.iloc[header_row].values
+        sdf = sdf_raw.iloc[header_row + 1:].copy()
+        sdf.columns = columns_labels
+        sdf.reset_index(drop=True, inplace=True)
+        
+        # 3. Čišćenje i filtriranje praznih redova
+        sdf = sdf.dropna(how="all").copy()
+        if not sdf.empty:
+            sdf["Pogon"] = _plant_from_sheet(_name)
+            frames.append(sdf)
+            
+    if not frames:
+        return pd.DataFrame()
+        
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    
+    # Ostatak originalne logike za čišćenje i validaciju polja ostaje netaknut
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]):
+            df[c] = df[c].astype(str).str.strip().replace(("", "nan", "None", "NaT"), pd.NA)
+            
+    subset = [_find_column(df, {k: v}) for k, v in _SUPPLIER_ALIASES.items()
+              if _find_column(df, {k: v}) is not None]
+    if subset:
+        df = df.dropna(subset=subset, how="any")
+    df = df.dropna(axis=1, how="all")
+    return df.reset_index(drop=True)
 
     Each row is tagged with its plant (from the sheet name) in a 'Pogon' column,
     because the report is organised one plant per sheet and that is the only place
